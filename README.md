@@ -20,9 +20,9 @@ let t = inverter.read_telemetry()?;
 println!("{:.0}%  battery {:+.0} W  grid {:+.0} W", t.soc_pct, t.battery_w, t.grid_w);
 
 // 3. Command it:
-inverter.charge(2_000.0)?;      // charge at 2 kW, importing if needed
-inverter.discharge(1_500.0)?;   // cover household load only; no export
-inverter.export(3_000.0)?;      // deliberately export to the grid
+inverter.charge(2_000)?;        // charge at 2,000 W, importing if needed
+inverter.discharge(1_500.0)?;   // float watts work too; no export
+inverter.export(3_000)?;        // deliberately export 3,000 W to the grid
 inverter.passive()?;            // back to the inverter's own self-use
 ```
 
@@ -45,7 +45,7 @@ That's the whole model. Full API reference: `cargo doc --open`.
 Every command method returns what the inverter actually committed to:
 
 ```rust
-let applied = inverter.charge(2_000.0)?;
+let applied = inverter.charge(2_000)?;
 
 applied.power_w;  // possibly clamped by the hardware
 applied.expiry;   // how this command ends — the crate's reason to exist
@@ -79,7 +79,7 @@ use inverter::Mode;
 
 let caps = inverter.capabilities();
 if caps.supports(Mode::ForceCharge) {
-    inverter.charge(2_000.0)?;
+    inverter.charge(2_000)?;
 } else {
     println!("no writes: {}", caps.write_blocked_reason.unwrap_or("unsupported"));
 }
@@ -110,7 +110,7 @@ be stored, compared, logged and applied later:
 use inverter::Command;
 use std::time::Duration;
 
-let cmd = Command::charge(2_000.0).holding_for(Duration::from_secs(60));
+let cmd = Command::charge(2_000).holding_for(Duration::from_secs(60));
 inverter.apply(cmd)?;
 ```
 

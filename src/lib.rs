@@ -31,8 +31,8 @@
 //! println!("battery at {}%", telemetry.soc_pct);
 //!
 //! if caps.supports(Mode::ForceCharge) {
-//!     // Sugar for inv.apply(Command::charge(2_000.0)).
-//!     let applied = inv.charge(2_000.0).unwrap();
+//!     // Sugar for inv.apply(Command::charge(2_000)).
+//!     let applied = inv.charge(2_000).unwrap();
 //!     // How this command ends is data, not an assumption.
 //!     println!("expires: {:?}", applied.expiry);
 //! }
@@ -161,31 +161,31 @@ impl Command {
         }
     }
 
-    /// Charge at `power_w`, importing if necessary.
-    pub fn charge(power_w: f64) -> Self {
+    /// Charge at `power_w` watts, importing if necessary.
+    pub fn charge(power_w: impl Into<f64>) -> Self {
         Command {
             mode: Mode::ForceCharge,
-            power_w,
+            power_w: power_w.into(),
             target: DischargeTarget::HouseOnly,
             hold: DEFAULT_HOLD,
         }
     }
 
-    /// Discharge at `power_w` to cover household load, without exporting.
-    pub fn discharge(power_w: f64) -> Self {
+    /// Discharge at `power_w` watts to cover household load, without exporting.
+    pub fn discharge(power_w: impl Into<f64>) -> Self {
         Command {
             mode: Mode::ForceDischarge,
-            power_w,
+            power_w: power_w.into(),
             target: DischargeTarget::HouseOnly,
             hold: DEFAULT_HOLD,
         }
     }
 
-    /// Discharge at `power_w`, deliberately exporting to the grid.
-    pub fn export(power_w: f64) -> Self {
+    /// Discharge at `power_w` watts, deliberately exporting to the grid.
+    pub fn export(power_w: impl Into<f64>) -> Self {
         Command {
             mode: Mode::ForceDischarge,
-            power_w,
+            power_w: power_w.into(),
             target: DischargeTarget::GridExport,
             hold: DEFAULT_HOLD,
         }
@@ -369,18 +369,18 @@ pub trait InverterExt: Inverter {
         self.apply(Command::passive())
     }
 
-    /// Charge at `power_w`, importing if necessary.
-    fn charge(&mut self, power_w: f64) -> Result<Applied, Error> {
+    /// Charge at `power_w` watts, importing if necessary.
+    fn charge(&mut self, power_w: impl Into<f64>) -> Result<Applied, Error> {
         self.apply(Command::charge(power_w))
     }
 
-    /// Discharge at `power_w` to cover household load, without exporting.
-    fn discharge(&mut self, power_w: f64) -> Result<Applied, Error> {
+    /// Discharge at `power_w` watts to cover household load, without exporting.
+    fn discharge(&mut self, power_w: impl Into<f64>) -> Result<Applied, Error> {
         self.apply(Command::discharge(power_w))
     }
 
-    /// Discharge at `power_w`, deliberately exporting to the grid.
-    fn export(&mut self, power_w: f64) -> Result<Applied, Error> {
+    /// Discharge at `power_w` watts, deliberately exporting to the grid.
+    fn export(&mut self, power_w: impl Into<f64>) -> Result<Applied, Error> {
         self.apply(Command::export(power_w))
     }
 }
@@ -429,6 +429,13 @@ mod tests {
             Command::export(3_000.0).describe(),
             "force_discharge@3000W(grid-export)"
         );
+    }
+
+    #[test]
+    fn command_power_accepts_integer_or_float_watts() {
+        assert_eq!(Command::charge(2_000).power_w, 2_000.0);
+        assert_eq!(Command::discharge(1_500.5).power_w, 1_500.5);
+        assert_eq!(Command::export(3_000).power_w, 3_000.0);
     }
 
     #[test]

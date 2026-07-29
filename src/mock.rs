@@ -34,7 +34,7 @@ impl Default for MockInverter {
 }
 
 impl MockInverter {
-    /// A 10 kWh battery on a 5 kW inverter at 50%, with a 400 W household load.
+    /// A 10 kWh battery on a 5,000 W inverter at 50%, with a 400 W household load.
     pub fn new() -> Self {
         let now = Instant::now();
         Self {
@@ -198,9 +198,9 @@ mod tests {
         let mut sugared = MockInverter::new();
         let mut explicit = MockInverter::new();
         for (via_ext, command) in [
-            (sugared.charge(2_000.0), Command::charge(2_000.0)),
+            (sugared.charge(2_000), Command::charge(2_000)),
             (sugared.discharge(1_500.0), Command::discharge(1_500.0)),
-            (sugared.export(3_000.0), Command::export(3_000.0)),
+            (sugared.export(3_000), Command::export(3_000)),
             (sugared.passive(), Command::passive()),
         ] {
             let via_ext = via_ext.unwrap();
