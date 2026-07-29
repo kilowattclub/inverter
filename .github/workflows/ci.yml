@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update --no-self-update stable
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update --no-self-update stable
+      - run: cargo test --all-features
+
+  # Every feature must build and pass clippy on its own: downstream users
+  # pick and choose, and an untested combination is a broken one.
+  features:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flags:
+          - "--no-default-features"
+          - "--no-default-features --features serial"
+          - "--no-default-features --features tcp"
+          - "--no-default-features --features foxess"
+          - "--no-default-features --features mock"
+          - "--no-default-features --features foxess,serial"
+          - "--no-default-features --features foxess,tcp"
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update --no-self-update stable
+      - run: cargo clippy --all-targets ${{ matrix.flags }} -- -D warnings
+      - run: cargo test ${{ matrix.flags }}
