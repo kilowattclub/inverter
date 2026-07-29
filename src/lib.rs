@@ -86,16 +86,37 @@ pub enum Error {
 }
 
 /// What the inverter should be doing.
+///
+/// [`Passive`](Mode::Passive) is the inverter's own behaviour; the other two
+/// override it. The overrides are what need [`Expiry`] semantics — passive
+/// has no power level and nothing to expire, which is what makes it the safe
+/// fallback.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Mode {
-    /// The inverter's own self-consumption behaviour, with no imposed schedule.
+    /// The controller steps out of the way: the inverter runs its own
+    /// self-use logic, exactly as it would with no controller attached.
     ///
-    /// This is the state every driver must be able to return to, and the state
-    /// a caller should fall back to when it is unsure.
+    /// Concretely: solar powers the house; surplus charges the battery, then
+    /// exports once the battery is full; after dark the battery covers the
+    /// house down to the inverter's configured minimum state of charge, then
+    /// the grid takes over. "Passive" describes the *controller's* stance —
+    /// the hardware is busy. Vendors call this "self-use",
+    /// "self-consumption" or "general" mode.
+    ///
+    /// This is the state every writable driver must be able to return to,
+    /// the state a caller should fall back to when unsure, and the state a
+    /// dead controller's hardware should decay to.
     Passive,
-    /// Charge the battery, importing from the grid if needed.
+    /// Force energy into the battery now, importing from the grid when solar
+    /// cannot cover the requested power.
+    ///
+    /// Overrides the self-use economics — this is how a controller buys a
+    /// cheap tariff window.
     ForceCharge,
-    /// Discharge the battery.
+    /// Force energy out of the battery now.
+    ///
+    /// Where the energy goes — household load only, or deliberately out past
+    /// the meter — is the command's [`DischargeTarget`].
     ForceDischarge,
 }
 
@@ -155,7 +176,7 @@ pub struct Command {
 pub const DEFAULT_HOLD: Duration = Duration::from_secs(300);
 
 impl Command {
-    /// Return to the inverter's own self-use behaviour.
+    /// Return to the inverter's own self-use behaviour ([`Mode::Passive`]).
     pub fn passive() -> Self {
         Command {
             mode: Mode::Passive,
@@ -369,7 +390,7 @@ pub trait Inverter: Send {
 /// reaches hardware through `apply`, whichever spelling the caller used. For
 /// a non-default hold, build the [`Command`] and call `apply` directly.
 pub trait InverterExt: Inverter {
-    /// Return to the inverter's own self-use behaviour.
+    /// Return to the inverter's own self-use behaviour ([`Mode::Passive`]).
     fn passive(&mut self) -> Result<Applied, Error> {
         self.apply(Command::passive())
     }

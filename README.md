@@ -40,6 +40,20 @@ let mut inverter = FoxEss::open_tcp("10.0.0.5:502", 247, &registers::H1_G2)?;
 
 That's the whole model. Full API reference: `cargo doc --open`.
 
+## What each command does
+
+| Command | The inverter... |
+|---|---|
+| `passive()` | runs its **own self-use logic**, exactly as if no controller were attached: solar powers the house, surplus charges the battery then exports, and after dark the battery covers the house down to its minimum SoC. Vendors call this "self-use" or "self-consumption". |
+| `charge(kw)` | **forces energy into the battery** at `kw`, importing from the grid when solar can't cover it — how a controller buys a cheap tariff window. |
+| `discharge(kw)` | **forces energy out of the battery** at `kw`, but only to cover the household load — nothing is pushed past the meter. |
+| `export(kw)` | **forces energy out of the battery and past the meter** at `kw`, deliberately exporting — for things like grid-services events. |
+
+Passive is the safe floor: it has no power level and nothing to expire, so
+it is always safe to command, and it is what a dead controller's hardware
+should decay to. The three overrides are the commands that need the expiry
+semantics below.
+
 ## How a command ends
 
 Every command method returns what the inverter actually committed to:
