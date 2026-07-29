@@ -1,0 +1,24 @@
+[package]
+name = "inverter"
+version = "0.1.0"
+edition = "2021"
+description = "Hybrid solar/battery inverter control: telemetry, modes, and honest command-expiry semantics"
+license = "MIT"
+repository = "https://github.com/kilowattclub/inverter"
+keywords = ["modbus", "inverter", "battery", "solar", "energy"]
+categories = ["embedded", "hardware-support"]
+
+[features]
+default = ["serial", "tcp", "foxess", "mock"]
+serial = ["dep:serialport"]
+tcp = []
+foxess = []
+mock = []
+
+[dependencies]
+log = "0.4"
+rmodbus = "0.12"
+thiserror = "2"
+# A fixed serial port needs no hotplug enumeration; disabling the default
+# `libudev` feature avoids a build dependency on libudev-dev.
+serialport = { version = "4", default-features = false, optional = true }
