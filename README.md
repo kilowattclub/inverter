@@ -67,15 +67,16 @@ assert!(applied.expiry.is_dead_controller_safe());
 Transports:
 
 ```rust
-use inverter::foxess::FoxEss;
+use inverter::foxess::{registers, FoxEss};
 
 // RS485 adapter wired to the inverter. Use a stable by-id path — /dev/ttyUSB0
-// changes number across boots and when another adapter is present.
-let inv = FoxEss::open_serial("/dev/serial/by-id/usb-...", 9600, 247)?;
+// changes number across boots and when another adapter is present. The map
+// must match the generation: a G2 serves different registers than a G1.
+let inv = FoxEss::open_serial("/dev/serial/by-id/usb-...", 9600, 247, &registers::H1_G2)?;
 
 // Or a network bridge (Elfin EW11 and similar) sitting beside the inverter,
 // which lets the controller live somewhere with better signal.
-let inv = FoxEss::open_tcp("10.0.0.5:502", 247)?;
+let inv = FoxEss::open_tcp("10.0.0.5:502", 247, &registers::H1_G2)?;
 ```
 
 ## Sign conventions
@@ -94,7 +95,7 @@ Normalised across every driver, whatever the inverter reports natively:
 | Driver | Reads | Writes | Notes |
 |---|---|---|---|
 | `mock` | ✅ | ✅ | Full simulation with a real one-shot timeout |
-| `foxess` | ⚠️ unverified | ❌ | H1-series map from community documentation |
+| `foxess` | ⚠️ unverified | ❌ | H1 G1 and G2 maps (RS485) from community documentation |
 
 **FoxESS writes are deliberately not implemented.** The register map is
 compiled from community documentation and has not been checked against
@@ -107,11 +108,14 @@ charging, discharging, idle, and at both ends of the state-of-charge range.
 Contributions of verified maps are very welcome; please say which model,
 firmware version and connection route you verified against.
 
-The open question for FoxESS is whether the H1's remote-control registers
-carry a **duration** field. If they do, the write path can offer
-`Expiry::InverterTimeout` and a dead controller is safe by construction. If
-they only expose recurring charge windows, any write path must be
-`Expiry::RecurringWindow` and callers need to know that.
+The H1's remote-control register block carries a genuine **watchdog**: a
+timeout register the inverter counts down on its own, reverting to its
+programmed work mode when it expires. That means a verified write path can
+offer `Expiry::InverterTimeout` — a dead controller is safe by construction.
+The block's addresses and semantics are recorded as data in
+`foxess::registers::remote_control`, sourced from the
+[`nathanmarlor/foxess_modbus`](https://github.com/nathanmarlor/foxess_modbus)
+integration (MIT); they remain unverified on hardware, so writes stay closed.
 
 ## Features
 
