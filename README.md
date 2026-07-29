@@ -114,6 +114,21 @@ come from every driver, whatever the inverter's native convention:
 `t.export_kw()` gives grid export as a positive number; `t.age()` is a
 monotonic staleness check that NTP steps cannot corrupt.
 
+For a one-off value there are single-field methods — sugar over
+`read_telemetry`, so each call performs a full read; batch with
+`read_telemetry` when you need several:
+
+```rust
+let soc = inverter.soc_pct()?;
+let export = inverter.export_kw()?;
+```
+
+`inverter.mode()?` asks which [`Mode`] is currently in force. A driver that
+cannot read that back from the hardware errors instead of repeating its last
+command — a stale answer would hide an expired or externally-changed
+command. The mock answers exactly (it simulates the timeout); FoxESS is
+`Unsupported` until its remote-control registers are verified readable.
+
 ## Commands as data
 
 The methods above are sugar over one underlying operation,

@@ -99,7 +99,7 @@ impl MockInverter {
         }
     }
 
-    fn battery_kw(&self) -> f64 {
+    fn battery_flow_kw(&self) -> f64 {
         let requested = self.command.power_kw.abs().min(self.max_power_kw);
         match self.command.mode {
             Mode::Passive => {
@@ -115,7 +115,7 @@ impl MockInverter {
     fn step(&mut self, elapsed: Duration) {
         self.expire_if_due();
         let hours = elapsed.as_secs_f64() / 3600.0;
-        let delta_kwh = self.battery_kw() * hours;
+        let delta_kwh = self.battery_flow_kw() * hours;
         let stored = self.capacity_kwh * self.soc_pct / 100.0 + delta_kwh;
         self.soc_pct = (stored / self.capacity_kwh * 100.0).clamp(0.0, 100.0);
     }
@@ -138,7 +138,7 @@ impl Inverter for MockInverter {
         self.step(elapsed);
         self.last_step = Instant::now();
 
-        let battery_kw = self.battery_kw();
+        let battery_kw = self.battery_flow_kw();
         let load_kw = self.baseline_load_kw;
         // AC balance: what the house and battery need beyond PV comes from the grid.
         let grid_kw = load_kw + battery_kw - self.solar_kw;
@@ -186,6 +186,12 @@ impl Inverter for MockInverter {
             power_kw: command.power_kw.min(self.max_power_kw),
         })
     }
+
+    // The mock genuinely knows its mode: it is the hardware, timeout included.
+    fn mode(&mut self) -> Result<Mode, Error> {
+        self.expire_if_due();
+        Ok(self.command.mode)
+    }
 }
 
 #[cfg(test)]
@@ -208,6 +214,36 @@ mod tests {
             assert_eq!(via_ext.expiry, via_apply.expiry);
             assert_eq!(via_ext.power_kw, via_apply.power_kw);
         }
+    }
+
+    #[test]
+    fn telemetry_getters_are_partial_applications_of_read_telemetry() {
+        let mut inv = MockInverter::new().with_load_kw(0.3).with_solar_kw(2.3);
+        inv.apply(Command::passive()).unwrap();
+        let t = inv.read_telemetry().unwrap();
+        // The simulation steps by real elapsed time, so SoC drifts a hair
+        // between reads; the powers are functions of the command and config.
+        assert!((inv.soc_pct().unwrap() - t.soc_pct).abs() < 1e-6);
+        assert_eq!(inv.battery_kw().unwrap(), t.battery_kw);
+        assert_eq!(inv.grid_kw().unwrap(), t.grid_kw);
+        assert_eq!(inv.load_kw().unwrap(), t.load_kw);
+        assert_eq!(inv.solar_kw().unwrap(), t.solar_kw);
+        assert_eq!(inv.export_kw().unwrap(), t.export_kw());
+    }
+
+    #[test]
+    fn mode_reports_the_live_state_including_the_timeout_revert() {
+        let mut inv = MockInverter::new();
+        assert_eq!(inv.mode().unwrap(), Mode::Passive);
+        inv.apply(Command::charge(1).holding_for(Duration::from_millis(1)))
+            .unwrap();
+        assert_eq!(inv.mode().unwrap(), Mode::ForceCharge);
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            inv.mode().unwrap(),
+            Mode::Passive,
+            "mode must report the hardware's revert, not the last command"
+        );
     }
 
     #[test]

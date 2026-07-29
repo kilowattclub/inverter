@@ -27,7 +27,7 @@
 
 use crate::modbus::{read_words, with_retries, ModbusBus};
 use crate::register::{decode, RegisterDef};
-use crate::{Applied, Capabilities, Command, Error, Expiry, Inverter, Telemetry};
+use crate::{Applied, Capabilities, Command, Error, Expiry, Inverter, Mode, Telemetry};
 use std::time::{Instant, SystemTime};
 
 const LOG_TARGET: &str = "inverter.foxess";
@@ -244,12 +244,20 @@ impl<B: ModbusBus> Inverter for FoxEss<B> {
             command.describe()
         )))
     }
+
+    fn mode(&mut self) -> Result<Mode, Error> {
+        // The imposed state lives in the unverified remote-control block, and
+        // repeating a guess would hide an expired or app-driven change.
+        Err(Error::Unsupported(
+            "FoxESS mode read-back is not implemented: the remote-control              registers are unverified"
+                .into(),
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Mode;
     use std::collections::HashMap;
 
     /// What a verified write path would eventually expose. Asserted against so
@@ -369,6 +377,12 @@ mod tests {
                 assert!(!caps.supports(*mode), "{mode:?} must not be advertised");
             }
         }
+    }
+
+    #[test]
+    fn mode_read_back_is_honestly_unsupported() {
+        let mut inv = FoxEss::new(g2_fixture(), &registers::H1_G2);
+        assert!(matches!(inv.mode(), Err(Error::Unsupported(_))));
     }
 
     #[test]

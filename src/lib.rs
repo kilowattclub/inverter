@@ -378,17 +378,30 @@ pub trait Inverter: Send {
     /// unavailable. Implementors should verify writes by reading them back.
     fn apply(&mut self, command: Command) -> Result<Applied, Error>;
 
+    /// The [`Mode`] currently in force, as far as this driver can know it.
+    ///
+    /// Drivers must not guess. A driver that cannot read the imposed state
+    /// back from the hardware returns [`Error::Unsupported`] rather than
+    /// repeating what it last commanded — a stale belief is exactly the
+    /// mistake that hides an expired or externally-changed command.
+    fn mode(&mut self) -> Result<Mode, Error>;
+
     /// Release the transport. Called once, on shutdown.
     fn close(&mut self) {}
 }
 
-/// Partial applications of [`Inverter::apply`], one per command shape.
+/// Partial applications of the [`Inverter`] operations.
 ///
-/// Sugar only: each builds the matching [`Command`] with [`DEFAULT_HOLD`] and
-/// calls [`Inverter::apply`]. The blanket implementation is the only one the
-/// coherence rules allow, so no driver can override these — every command
-/// reaches hardware through `apply`, whichever spelling the caller used. For
-/// a non-default hold, build the [`Command`] and call `apply` directly.
+/// Sugar only, in two groups. The command methods each build the matching
+/// [`Command`] with [`DEFAULT_HOLD`] and call [`Inverter::apply`]; for a
+/// non-default hold, build the [`Command`] and call `apply` directly. The
+/// telemetry methods each perform a **full** [`Inverter::read_telemetry`]
+/// and return one field — convenient for a one-off check, wasteful in a
+/// loop; when you need several values, read once and use the fields.
+///
+/// The blanket implementation is the only one the coherence rules allow, so
+/// no driver can override these — every spelling reaches hardware through
+/// `apply` and `read_telemetry`.
 pub trait InverterExt: Inverter {
     /// Return to the inverter's own self-use behaviour ([`Mode::Passive`]).
     fn passive(&mut self) -> Result<Applied, Error> {
@@ -408,6 +421,39 @@ pub trait InverterExt: Inverter {
     /// Discharge at `power_kw`, deliberately exporting to the grid.
     fn export(&mut self, power_kw: impl Into<f64>) -> Result<Applied, Error> {
         self.apply(Command::export(power_kw))
+    }
+
+    /// Battery state of charge, percent. Performs a full telemetry read.
+    fn soc_pct(&mut self) -> Result<f64, Error> {
+        Ok(self.read_telemetry()?.soc_pct)
+    }
+
+    /// Battery power, kilowatts; positive means charging. Performs a full
+    /// telemetry read.
+    fn battery_kw(&mut self) -> Result<f64, Error> {
+        Ok(self.read_telemetry()?.battery_kw)
+    }
+
+    /// Grid power, kilowatts; positive means importing. Performs a full
+    /// telemetry read.
+    fn grid_kw(&mut self) -> Result<f64, Error> {
+        Ok(self.read_telemetry()?.grid_kw)
+    }
+
+    /// Household consumption, kilowatts. Performs a full telemetry read.
+    fn load_kw(&mut self) -> Result<f64, Error> {
+        Ok(self.read_telemetry()?.load_kw)
+    }
+
+    /// PV generation, kilowatts. Performs a full telemetry read.
+    fn solar_kw(&mut self) -> Result<f64, Error> {
+        Ok(self.read_telemetry()?.solar_kw)
+    }
+
+    /// Grid export, kilowatts; zero while importing. Performs a full
+    /// telemetry read.
+    fn export_kw(&mut self) -> Result<f64, Error> {
+        Ok(self.read_telemetry()?.export_kw())
     }
 }
 
