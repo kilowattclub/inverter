@@ -15,9 +15,12 @@ use inverter::{Inverter, InverterExt, mock::MockInverter};
 // 1. Open a driver. The mock needs no hardware:
 let mut inverter = MockInverter::new();
 
-// 2. Read telemetry:
+// 2. Read telemetry — everything at once, or single values:
 let t = inverter.read_telemetry()?;
 println!("{:.0}%  battery {:+.2} kW  grid {:+.2} kW", t.soc_pct, t.battery_kw, t.grid_kw);
+
+let soc = inverter.soc_pct()?;    // one field, one call
+let mode = inverter.mode()?;      // the Mode currently in force
 
 // 3. Command it. Powers are kilowatts; int or float both work:
 inverter.charge(2)?;        // charge at 2 kW, importing if needed

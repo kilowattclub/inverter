@@ -34,6 +34,10 @@
 //! let telemetry = inv.read_telemetry().unwrap();
 //! println!("battery at {}%", telemetry.soc_pct);
 //!
+//! // Or single values, and the mode currently in force:
+//! let soc = inv.soc_pct().unwrap();
+//! assert_eq!(inv.mode().unwrap(), Mode::Passive);
+//!
 //! if caps.supports(Mode::ForceCharge) {
 //!     // Sugar for inv.apply(Command::charge(2)). Powers are kilowatts.
 //!     let applied = inv.charge(2).unwrap();
