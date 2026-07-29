@@ -191,6 +191,24 @@ impl Inverter for MockInverter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::InverterExt;
+
+    #[test]
+    fn ext_methods_are_partial_applications_of_apply() {
+        let mut sugared = MockInverter::new();
+        let mut explicit = MockInverter::new();
+        for (via_ext, command) in [
+            (sugared.charge(2_000.0), Command::charge(2_000.0)),
+            (sugared.discharge(1_500.0), Command::discharge(1_500.0)),
+            (sugared.export(3_000.0), Command::export(3_000.0)),
+            (sugared.passive(), Command::passive()),
+        ] {
+            let via_ext = via_ext.unwrap();
+            let via_apply = explicit.apply(command).unwrap();
+            assert_eq!(via_ext.expiry, via_apply.expiry);
+            assert_eq!(via_ext.power_w, via_apply.power_w);
+        }
+    }
 
     #[test]
     fn charging_raises_the_state_of_charge() {

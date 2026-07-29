@@ -21,7 +21,7 @@
 //!
 //! ```
 //! # #[cfg(feature = "mock")] {
-//! use inverter::{Command, Inverter, mock::MockInverter};
+//! use inverter::{Inverter, InverterExt, Mode, mock::MockInverter};
 //!
 //! let mut inv = MockInverter::new();
 //! let caps = inv.capabilities();
@@ -30,8 +30,9 @@
 //! let telemetry = inv.read_telemetry().unwrap();
 //! println!("battery at {}%", telemetry.soc_pct);
 //!
-//! if caps.supports(Command::charge(2_000.0).mode) {
-//!     let applied = inv.apply(Command::charge(2_000.0)).unwrap();
+//! if caps.supports(Mode::ForceCharge) {
+//!     // Sugar for inv.apply(Command::charge(2_000.0)).
+//!     let applied = inv.charge(2_000.0).unwrap();
 //!     // How this command ends is data, not an assumption.
 //!     println!("expires: {:?}", applied.expiry);
 //! }
@@ -354,6 +355,37 @@ pub trait Inverter: Send {
     /// Release the transport. Called once, on shutdown.
     fn close(&mut self) {}
 }
+
+/// Partial applications of [`Inverter::apply`], one per command shape.
+///
+/// Sugar only: each builds the matching [`Command`] with [`DEFAULT_HOLD`] and
+/// calls [`Inverter::apply`]. The blanket implementation is the only one the
+/// coherence rules allow, so no driver can override these — every command
+/// reaches hardware through `apply`, whichever spelling the caller used. For
+/// a non-default hold, build the [`Command`] and call `apply` directly.
+pub trait InverterExt: Inverter {
+    /// Return to the inverter's own self-use behaviour.
+    fn passive(&mut self) -> Result<Applied, Error> {
+        self.apply(Command::passive())
+    }
+
+    /// Charge at `power_w`, importing if necessary.
+    fn charge(&mut self, power_w: f64) -> Result<Applied, Error> {
+        self.apply(Command::charge(power_w))
+    }
+
+    /// Discharge at `power_w` to cover household load, without exporting.
+    fn discharge(&mut self, power_w: f64) -> Result<Applied, Error> {
+        self.apply(Command::discharge(power_w))
+    }
+
+    /// Discharge at `power_w`, deliberately exporting to the grid.
+    fn export(&mut self, power_w: f64) -> Result<Applied, Error> {
+        self.apply(Command::export(power_w))
+    }
+}
+
+impl<I: Inverter + ?Sized> InverterExt for I {}
 
 #[cfg(test)]
 mod tests {

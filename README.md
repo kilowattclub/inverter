@@ -54,13 +54,15 @@ moment you needed it to work.
 ## Usage
 
 ```rust
-use inverter::{Command, Inverter, mock::MockInverter};
+use inverter::{Command, Inverter, InverterExt, mock::MockInverter};
 
 let mut inv = MockInverter::new();
 let telemetry = inv.read_telemetry()?;
 println!("{}%, battery {:+.0} W", telemetry.soc_pct, telemetry.battery_w);
 
-let applied = inv.apply(Command::charge(2_000.0))?;
+// Sugar for inv.apply(Command::charge(2_000.0)); commands are still data,
+// and every spelling reaches the driver through apply().
+let applied = inv.charge(2_000.0)?;
 assert!(applied.expiry.is_dead_controller_safe());
 ```
 
