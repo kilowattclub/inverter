@@ -17,11 +17,11 @@ const MODES: &[Mode] = &[Mode::Passive, Mode::ForceCharge, Mode::ForceDischarge]
 
 /// A simulated battery and inverter.
 pub struct MockInverter {
-    capacity_wh: f64,
-    max_power_w: f64,
+    capacity_kwh: f64,
+    max_power_kw: f64,
     soc_pct: f64,
-    baseline_load_w: f64,
-    solar_w: f64,
+    baseline_load_kw: f64,
+    solar_kw: f64,
     command: Command,
     commanded_at: Instant,
     last_step: Instant,
@@ -34,48 +34,48 @@ impl Default for MockInverter {
 }
 
 impl MockInverter {
-    /// A 10 kWh battery on a 5 kW inverter at 50%, with a 400 W household load.
+    /// A 10 kWh battery on a 5 kW inverter at 50%, with a 0.4 kW household load.
     pub fn new() -> Self {
         let now = Instant::now();
         Self {
-            capacity_wh: 10_000.0,
-            max_power_w: 5_000.0,
+            capacity_kwh: 10.0,
+            max_power_kw: 5.0,
             soc_pct: 50.0,
-            baseline_load_w: 400.0,
-            solar_w: 0.0,
+            baseline_load_kw: 0.4,
+            solar_kw: 0.0,
             command: Command::passive(),
             commanded_at: now,
             last_step: now,
         }
     }
 
-    /// Set the usable capacity in watt-hours.
-    pub fn with_capacity_wh(mut self, capacity_wh: f64) -> Self {
-        self.capacity_wh = capacity_wh;
+    /// Set the usable capacity in kilowatt-hours.
+    pub fn with_capacity_kwh(mut self, capacity_kwh: impl Into<f64>) -> Self {
+        self.capacity_kwh = capacity_kwh.into();
         self
     }
 
-    /// Set the inverter's power limit in watts.
-    pub fn with_max_power_w(mut self, max_power_w: f64) -> Self {
-        self.max_power_w = max_power_w;
+    /// Set the inverter's power limit in kilowatts.
+    pub fn with_max_power_kw(mut self, max_power_kw: impl Into<f64>) -> Self {
+        self.max_power_kw = max_power_kw.into();
         self
     }
 
     /// Set the starting state of charge.
-    pub fn with_soc_pct(mut self, soc_pct: f64) -> Self {
-        self.soc_pct = soc_pct.clamp(0.0, 100.0);
+    pub fn with_soc_pct(mut self, soc_pct: impl Into<f64>) -> Self {
+        self.soc_pct = soc_pct.into().clamp(0.0, 100.0);
         self
     }
 
-    /// Set the simulated household load in watts.
-    pub fn with_load_w(mut self, load_w: f64) -> Self {
-        self.baseline_load_w = load_w.max(0.0);
+    /// Set the simulated household load in kilowatts.
+    pub fn with_load_kw(mut self, load_kw: impl Into<f64>) -> Self {
+        self.baseline_load_kw = load_kw.into().max(0.0);
         self
     }
 
-    /// Set simulated PV generation in watts.
-    pub fn with_solar_w(mut self, solar_w: f64) -> Self {
-        self.solar_w = solar_w.max(0.0);
+    /// Set simulated PV generation in kilowatts.
+    pub fn with_solar_kw(mut self, solar_kw: impl Into<f64>) -> Self {
+        self.solar_kw = solar_kw.into().max(0.0);
         self
     }
 
@@ -99,13 +99,13 @@ impl MockInverter {
         }
     }
 
-    fn battery_w(&self) -> f64 {
-        let requested = self.command.power_w.abs().min(self.max_power_w);
+    fn battery_kw(&self) -> f64 {
+        let requested = self.command.power_kw.abs().min(self.max_power_kw);
         match self.command.mode {
             Mode::Passive => {
                 // Self-use: soak surplus PV, otherwise cover the load.
-                let surplus = self.solar_w - self.baseline_load_w;
-                surplus.clamp(-self.max_power_w, self.max_power_w)
+                let surplus = self.solar_kw - self.baseline_load_kw;
+                surplus.clamp(-self.max_power_kw, self.max_power_kw)
             }
             Mode::ForceCharge => requested,
             Mode::ForceDischarge => -requested,
@@ -115,9 +115,9 @@ impl MockInverter {
     fn step(&mut self, elapsed: Duration) {
         self.expire_if_due();
         let hours = elapsed.as_secs_f64() / 3600.0;
-        let delta_wh = self.battery_w() * hours;
-        let stored = self.capacity_wh * self.soc_pct / 100.0 + delta_wh;
-        self.soc_pct = (stored / self.capacity_wh * 100.0).clamp(0.0, 100.0);
+        let delta_kwh = self.battery_kw() * hours;
+        let stored = self.capacity_kwh * self.soc_pct / 100.0 + delta_kwh;
+        self.soc_pct = (stored / self.capacity_kwh * 100.0).clamp(0.0, 100.0);
     }
 }
 
@@ -138,25 +138,25 @@ impl Inverter for MockInverter {
         self.step(elapsed);
         self.last_step = Instant::now();
 
-        let battery_w = self.battery_w();
-        let load_w = self.baseline_load_w;
+        let battery_kw = self.battery_kw();
+        let load_kw = self.baseline_load_kw;
         // AC balance: what the house and battery need beyond PV comes from the grid.
-        let grid_w = load_w + battery_w - self.solar_w;
-        let grid_w = if self.command.mode == Mode::ForceDischarge
+        let grid_kw = load_kw + battery_kw - self.solar_kw;
+        let grid_kw = if self.command.mode == Mode::ForceDischarge
             && self.command.target == DischargeTarget::HouseOnly
         {
             // Without an export path, discharge cannot push past the load.
-            grid_w.max(0.0)
+            grid_kw.max(0.0)
         } else {
-            grid_w
+            grid_kw
         };
 
         Ok(Telemetry {
             soc_pct: self.soc_pct,
-            battery_w,
-            grid_w,
-            load_w,
-            solar_w: self.solar_w,
+            battery_kw,
+            grid_kw,
+            load_kw,
+            solar_kw: self.solar_kw,
             at: SystemTime::now(),
             read_at: Instant::now(),
         })
@@ -169,10 +169,10 @@ impl Inverter for MockInverter {
                 command.mode.as_str()
             )));
         }
-        if !command.power_w.is_finite() || command.power_w < 0.0 {
+        if !command.power_kw.is_finite() || command.power_kw < 0.0 {
             return Err(Error::Range(format!(
                 "power must be finite and non-negative, got {}",
-                command.power_w
+                command.power_kw
             )));
         }
         let elapsed = self.last_step.elapsed();
@@ -183,7 +183,7 @@ impl Inverter for MockInverter {
         self.commanded_at = Instant::now();
         Ok(Applied {
             expiry: Expiry::InverterTimeout(command.hold),
-            power_w: command.power_w.min(self.max_power_w),
+            power_kw: command.power_kw.min(self.max_power_kw),
         })
     }
 }
@@ -198,23 +198,23 @@ mod tests {
         let mut sugared = MockInverter::new();
         let mut explicit = MockInverter::new();
         for (via_ext, command) in [
-            (sugared.charge(2_000.0), Command::charge(2_000.0)),
-            (sugared.discharge(1_500.0), Command::discharge(1_500.0)),
-            (sugared.export(3_000.0), Command::export(3_000.0)),
+            (sugared.charge(2), Command::charge(2)),
+            (sugared.discharge(1.5), Command::discharge(1.5)),
+            (sugared.export(3), Command::export(3)),
             (sugared.passive(), Command::passive()),
         ] {
             let via_ext = via_ext.unwrap();
             let via_apply = explicit.apply(command).unwrap();
             assert_eq!(via_ext.expiry, via_apply.expiry);
-            assert_eq!(via_ext.power_w, via_apply.power_w);
+            assert_eq!(via_ext.power_kw, via_apply.power_kw);
         }
     }
 
     #[test]
     fn applied_power_is_clamped_to_the_inverter_limit() {
-        let mut inv = MockInverter::new().with_max_power_w(5_000.0);
-        let applied = inv.apply(Command::charge(50_000.0)).unwrap();
-        assert_eq!(applied.power_w, 5_000.0, "the clamp must be reported back");
+        let mut inv = MockInverter::new().with_max_power_kw(5);
+        let applied = inv.apply(Command::charge(50)).unwrap();
+        assert_eq!(applied.power_kw, 5.0, "the clamp must be reported back");
     }
 
     #[test]
@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn charging_raises_the_state_of_charge() {
         let mut inv = MockInverter::new().with_soc_pct(50.0);
-        inv.apply(Command::charge(1_000.0)).unwrap();
+        inv.apply(Command::charge(1)).unwrap();
         inv.advance(Duration::from_secs(3600));
         // 1 kWh into a 10 kWh battery is ten percentage points.
         assert!((inv.soc_pct - 60.0).abs() < 0.5, "soc was {}", inv.soc_pct);
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn a_command_reverts_to_passive_once_its_hold_elapses() {
         let mut inv = MockInverter::new();
-        inv.apply(Command::charge(1_000.0).holding_for(Duration::from_millis(1)))
+        inv.apply(Command::charge(1).holding_for(Duration::from_millis(1)))
             .unwrap();
         assert_eq!(inv.active_command().mode, Mode::ForceCharge);
         std::thread::sleep(Duration::from_millis(5));
@@ -252,30 +252,30 @@ mod tests {
     #[test]
     fn state_of_charge_is_clamped_at_both_ends() {
         let mut inv = MockInverter::new().with_soc_pct(99.0);
-        inv.apply(Command::charge(5_000.0)).unwrap();
+        inv.apply(Command::charge(5)).unwrap();
         inv.advance(Duration::from_secs(4 * 3600));
         assert!(inv.soc_pct <= 100.0);
 
         let mut inv = MockInverter::new().with_soc_pct(1.0);
-        inv.apply(Command::discharge(5_000.0)).unwrap();
+        inv.apply(Command::discharge(5)).unwrap();
         inv.advance(Duration::from_secs(4 * 3600));
         assert!(inv.soc_pct >= 0.0);
     }
 
     #[test]
     fn house_only_discharge_does_not_export() {
-        let mut inv = MockInverter::new().with_load_w(200.0);
-        inv.apply(Command::discharge(3_000.0)).unwrap();
+        let mut inv = MockInverter::new().with_load_kw(0.2);
+        inv.apply(Command::discharge(3)).unwrap();
         let t = inv.read_telemetry().unwrap();
-        assert_eq!(t.export_w(), 0.0, "house-only discharge must not export");
+        assert_eq!(t.export_kw(), 0.0, "house-only discharge must not export");
     }
 
     #[test]
     fn a_grid_export_command_does_export() {
-        let mut inv = MockInverter::new().with_load_w(200.0);
-        inv.apply(Command::export(3_000.0)).unwrap();
+        let mut inv = MockInverter::new().with_load_kw(0.2);
+        inv.apply(Command::export(3)).unwrap();
         let t = inv.read_telemetry().unwrap();
-        assert!(t.export_w() > 0.0, "export command must reach the grid");
+        assert!(t.export_kw() > 0.0, "export command must reach the grid");
     }
 
     #[test]
@@ -287,9 +287,9 @@ mod tests {
 
     #[test]
     fn passive_soaks_surplus_solar() {
-        let mut inv = MockInverter::new().with_load_w(300.0).with_solar_w(2_300.0);
+        let mut inv = MockInverter::new().with_load_kw(0.3).with_solar_kw(2.3);
         inv.apply(Command::passive()).unwrap();
         let t = inv.read_telemetry().unwrap();
-        assert!((t.battery_w - 2_000.0).abs() < 1.0, "got {}", t.battery_w);
+        assert!((t.battery_kw - 2.0).abs() < 1e-9, "got {}", t.battery_kw);
     }
 }

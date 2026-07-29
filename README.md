@@ -17,13 +17,13 @@ let mut inverter = MockInverter::new();
 
 // 2. Read telemetry:
 let t = inverter.read_telemetry()?;
-println!("{:.0}%  battery {:+.0} W  grid {:+.0} W", t.soc_pct, t.battery_w, t.grid_w);
+println!("{:.0}%  battery {:+.2} kW  grid {:+.2} kW", t.soc_pct, t.battery_kw, t.grid_kw);
 
-// 3. Command it:
-inverter.charge(2_000.0)?;      // charge at 2 kW, importing if needed
-inverter.discharge(1_500.0)?;   // cover household load only; no export
-inverter.export(3_000.0)?;      // deliberately export to the grid
-inverter.passive()?;            // back to the inverter's own self-use
+// 3. Command it. Powers are kilowatts; int or float both work:
+inverter.charge(2)?;        // charge at 2 kW, importing if needed
+inverter.discharge(1.5)?;   // cover household load only; no export
+inverter.export(3)?;        // deliberately export to the grid
+inverter.passive()?;        // back to the inverter's own self-use
 ```
 
 Real hardware instead of the mock:
@@ -45,10 +45,10 @@ That's the whole model. Full API reference: `cargo doc --open`.
 Every command method returns what the inverter actually committed to:
 
 ```rust
-let applied = inverter.charge(2_000.0)?;
+let applied = inverter.charge(2)?;
 
-applied.power_w;  // possibly clamped by the hardware
-applied.expiry;   // how this command ends — the crate's reason to exist
+applied.power_kw;  // possibly clamped by the hardware
+applied.expiry;    // how this command ends — the crate's reason to exist
 ```
 
 ```rust
@@ -79,24 +79,25 @@ use inverter::Mode;
 
 let caps = inverter.capabilities();
 if caps.supports(Mode::ForceCharge) {
-    inverter.charge(2_000.0)?;
+    inverter.charge(2)?;
 } else {
     println!("no writes: {}", caps.write_blocked_reason.unwrap_or("unsupported"));
 }
 ```
 
-## Telemetry sign conventions
+## Units and sign conventions
 
-The same signs from every driver, whatever the inverter's native convention:
+All powers are **kilowatts** (energies kilowatt-hours), and the same signs
+come from every driver, whatever the inverter's native convention:
 
 | Field | Meaning |
 |---|---|
-| `battery_w > 0` | charging (power into the cells) |
-| `grid_w > 0` | importing; `< 0` exporting |
-| `load_w >= 0` | household consumption |
-| `solar_w >= 0` | PV generation, `0.0` when unavailable |
+| `battery_kw > 0` | charging (power into the cells) |
+| `grid_kw > 0` | importing; `< 0` exporting |
+| `load_kw >= 0` | household consumption |
+| `solar_kw >= 0` | PV generation, `0.0` when unavailable |
 
-`t.export_w()` gives grid export as a positive number; `t.age()` is a
+`t.export_kw()` gives grid export as a positive number; `t.age()` is a
 monotonic staleness check that NTP steps cannot corrupt.
 
 ## Commands as data
@@ -110,7 +111,7 @@ be stored, compared, logged and applied later:
 use inverter::Command;
 use std::time::Duration;
 
-let cmd = Command::charge(2_000.0).holding_for(Duration::from_secs(60));
+let cmd = Command::charge(2).holding_for(Duration::from_secs(60));
 inverter.apply(cmd)?;
 ```
 

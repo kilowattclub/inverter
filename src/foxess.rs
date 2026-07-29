@@ -37,21 +37,22 @@ const WRITE_BLOCKED: &str = "FoxESS register map is unverified on hardware; \
 
 /// The registers a FoxESS telemetry read needs, for one model generation.
 ///
-/// Raw FoxESS values use the opposite sign to this crate for battery and grid
-/// power — positive raw means discharging and exporting respectively — so
-/// those registers carry a `-1` scale to land on crate conventions.
+/// Raw FoxESS power registers are watts, and battery/grid use the opposite
+/// sign to this crate — positive raw means discharging and exporting — so
+/// power registers carry a `0.001` scale (negated where the sign flips) to
+/// land on crate kilowatts.
 pub struct RegisterMap {
     /// Human-readable model identifier, surfaced in [`Capabilities::model`].
     pub model: &'static str,
     /// Battery state of charge, percent.
     pub battery_soc: RegisterDef,
-    /// Battery power, normalised so positive means charging.
+    /// Battery power, kilowatts, normalised so positive means charging.
     pub battery_power: RegisterDef,
-    /// Grid power, normalised so positive means importing.
+    /// Grid power, kilowatts, normalised so positive means importing.
     pub grid_power: RegisterDef,
-    /// Household consumption.
+    /// Household consumption, kilowatts.
     pub load_power: RegisterDef,
-    /// Per-string PV generation; summed into [`Telemetry::solar_w`].
+    /// Per-string PV generation; summed into [`Telemetry::solar_kw`].
     pub pv_powers: &'static [RegisterDef],
 }
 
@@ -68,12 +69,15 @@ pub mod registers {
     pub const H1_G1: RegisterMap = RegisterMap {
         model: "FoxESS H1 G1 (RS485, community map, unverified)",
         battery_soc: R::input("battery_soc", 11036),
-        // Raw: positive = discharging. Negated to crate convention.
-        battery_power: R::input("battery_power", 11008).signed().scale(-1.0),
-        // Raw: positive = exporting. Negated to crate convention.
-        grid_power: R::input("grid_ct", 11021).signed().scale(-1.0),
-        load_power: R::input("load_power", 11023).signed(),
-        pv_powers: &[R::input("pv1_power", 11002), R::input("pv2_power", 11005)],
+        // Raw: watts, positive = discharging. Scaled to charge-positive kW.
+        battery_power: R::input("battery_power", 11008).signed().scale(-0.001),
+        // Raw: watts, positive = exporting. Scaled to import-positive kW.
+        grid_power: R::input("grid_ct", 11021).signed().scale(-0.001),
+        load_power: R::input("load_power", 11023).signed().scale(0.001),
+        pv_powers: &[
+            R::input("pv1_power", 11002).scale(0.001),
+            R::input("pv2_power", 11005).scale(0.001),
+        ],
     };
 
     /// H1-G2, AC1-G2 and P1 over RS485: holding registers.
@@ -83,14 +87,14 @@ pub mod registers {
     pub const H1_G2: RegisterMap = RegisterMap {
         model: "FoxESS H1 G2 (RS485, community map, unverified)",
         battery_soc: R::holding("battery_soc", 31024),
-        // Raw: positive = discharging. Negated to crate convention.
-        battery_power: R::holding("battery_power", 31022).signed().scale(-1.0),
-        // Raw: positive = exporting. Negated to crate convention.
-        grid_power: R::holding("grid_ct", 31014).signed().scale(-1.0),
-        load_power: R::holding("load_power", 31016).signed(),
+        // Raw: watts, positive = discharging. Scaled to charge-positive kW.
+        battery_power: R::holding("battery_power", 31022).signed().scale(-0.001),
+        // Raw: watts, positive = exporting. Scaled to import-positive kW.
+        grid_power: R::holding("grid_ct", 31014).signed().scale(-0.001),
+        load_power: R::holding("load_power", 31016).signed().scale(0.001),
         pv_powers: &[
-            R::holding("pv1_power", 39280),
-            R::holding("pv2_power", 39282),
+            R::holding("pv1_power", 39280).scale(0.001),
+            R::holding("pv2_power", 39282).scale(0.001),
         ],
     };
 
@@ -105,7 +109,7 @@ pub mod registers {
     ///   multi-register writes; use function 6.
     /// * While enabled, [`remote_control::ACTIVE_POWER`] sets inverter power:
     ///   positive exports/discharges, negative imports/charges (opposite sign
-    ///   to [`crate::Telemetry::battery_w`] — a write path must negate).
+    ///   to [`crate::Telemetry::battery_kw`] — a write path must negate).
     /// * [`remote_control::TIMEOUT_SET`] is a watchdog reload in seconds. If
     ///   the controller stops writing, the inverter reverts *by itself* to
     ///   the work mode in [`remote_control::WORK_MODE`] — `foxess_modbus`
@@ -129,8 +133,9 @@ pub mod registers {
         pub const REMOTE_ENABLE: R = R::holding("remote_enable", 44000);
         /// Watchdog reload value, seconds.
         pub const TIMEOUT_SET: R = R::holding("timeout_set", 44001);
-        /// Power command, watts. Positive = export, negative = import.
-        pub const ACTIVE_POWER: R = R::holding("active_power", 44002).signed();
+        /// Power command, kilowatts (the raw register is watts).
+        /// Positive = export, negative = import.
+        pub const ACTIVE_POWER: R = R::holding("active_power", 44002).signed().scale(0.001);
         /// Work mode the inverter reverts to when the watchdog expires:
         /// 0 self-use, 1 feed-in first, 2 back-up.
         pub const WORK_MODE: R = R::holding("work_mode", 41000);
@@ -213,21 +218,21 @@ impl<B: ModbusBus> Inverter for FoxEss<B> {
     fn read_telemetry(&mut self) -> Result<Telemetry, Error> {
         let map = self.map;
         let soc_pct = self.read(&map.battery_soc)?;
-        let battery_w = self.read(&map.battery_power)?;
-        let grid_w = self.read(&map.grid_power)?;
+        let battery_kw = self.read(&map.battery_power)?;
+        let grid_kw = self.read(&map.grid_power)?;
         // FoxESS reports load signed and it can dip slightly negative from
-        // metering noise; the crate convention is load_w >= 0.
-        let load_w = self.read(&map.load_power)?.max(0.0);
-        let mut solar_w = 0.0;
+        // metering noise; the crate convention is load_kw >= 0.
+        let load_kw = self.read(&map.load_power)?.max(0.0);
+        let mut solar_kw = 0.0;
         for pv in map.pv_powers {
-            solar_w += self.read(pv)?;
+            solar_kw += self.read(pv)?;
         }
         Ok(Telemetry {
             soc_pct,
-            battery_w,
-            grid_w,
-            load_w,
-            solar_w,
+            battery_kw,
+            grid_kw,
+            load_kw,
+            solar_kw,
             at: SystemTime::now(),
             read_at: Instant::now(),
         })
@@ -320,15 +325,15 @@ mod tests {
     }
 
     #[test]
-    fn g1_normalises_foxess_signs_to_crate_conventions() {
+    fn g1_normalises_foxess_signs_and_watts_to_crate_conventions() {
         let mut inv = FoxEss::new(g1_fixture(), &registers::H1_G1);
         let t = inv.read_telemetry().unwrap();
         assert_eq!(t.soc_pct, 64.0);
-        assert_eq!(t.battery_w, 1500.0, "raw negative means charging");
-        assert_eq!(t.grid_w, 2000.0, "raw negative means importing");
-        assert_eq!(t.load_w, 500.0);
-        assert_eq!(t.solar_w, 0.0);
-        assert_eq!(t.export_w(), 0.0, "importing, so nothing is exported");
+        assert_eq!(t.battery_kw, 1.5, "raw negative watts mean charging");
+        assert_eq!(t.grid_kw, 2.0, "raw negative watts mean importing");
+        assert_eq!(t.load_kw, 0.5);
+        assert_eq!(t.solar_kw, 0.0);
+        assert_eq!(t.export_kw(), 0.0, "importing, so nothing is exported");
     }
 
     #[test]
@@ -336,11 +341,11 @@ mod tests {
         let mut inv = FoxEss::new(g2_fixture(), &registers::H1_G2);
         let t = inv.read_telemetry().unwrap();
         assert_eq!(t.soc_pct, 55.0);
-        assert_eq!(t.battery_w, -400.0, "raw positive means discharging");
-        assert_eq!(t.grid_w, -250.0, "raw positive means exporting");
-        assert_eq!(t.export_w(), 250.0);
-        assert_eq!(t.load_w, 750.0);
-        assert_eq!(t.solar_w, 600.0, "both PV strings summed");
+        assert_eq!(t.battery_kw, -0.4, "raw positive means discharging");
+        assert_eq!(t.grid_kw, -0.25, "raw positive means exporting");
+        assert_eq!(t.export_kw(), 0.25);
+        assert_eq!(t.load_kw, 0.75);
+        assert_eq!(t.solar_kw, 0.6, "both PV strings summed");
     }
 
     #[test]
@@ -349,7 +354,7 @@ mod tests {
         bus.holding
             .insert(registers::H1_G2.load_power.address, vec![(-5i16) as u16]);
         let mut inv = FoxEss::new(bus, &registers::H1_G2);
-        assert_eq!(inv.read_telemetry().unwrap().load_w, 0.0);
+        assert_eq!(inv.read_telemetry().unwrap().load_kw, 0.0);
     }
 
     #[test]
@@ -415,13 +420,17 @@ mod tests {
 
         for map in [g1, g2] {
             assert_eq!(
-                map.battery_power.scale, -1.0,
-                "raw battery power is discharge-positive and must be negated"
+                map.battery_power.scale, -0.001,
+                "raw battery watts are discharge-positive; scaled to charge-positive kW"
             );
             assert_eq!(
-                map.grid_power.scale, -1.0,
-                "raw grid power is export-positive and must be negated"
+                map.grid_power.scale, -0.001,
+                "raw grid watts are export-positive; scaled to import-positive kW"
             );
+            assert_eq!(map.load_power.scale, 0.001);
+            for pv in map.pv_powers {
+                assert_eq!(pv.scale, 0.001);
+            }
             assert!(map.battery_power.signed && map.grid_power.signed && map.load_power.signed);
         }
     }

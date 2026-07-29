@@ -12,10 +12,14 @@
 //! Every driver reports telemetry with these signs, whatever the inverter's
 //! own convention is:
 //!
-//! * `battery_w > 0` — charging (power into the cells)
-//! * `grid_w > 0` — importing; `< 0` — exporting
-//! * `load_w >= 0` — household consumption
-//! * `solar_w >= 0` — PV generation, `0.0` when the model cannot report it
+//! * `battery_kw > 0` — charging (power into the cells)
+//! * `grid_kw > 0` — importing; `< 0` — exporting
+//! * `load_kw >= 0` — household consumption
+//! * `solar_kw >= 0` — PV generation, `0.0` when the model cannot report it
+//!
+//! All powers are kilowatts and energies kilowatt-hours. Anywhere a power is
+//! taken, any numeric type convertible to `f64` is accepted: `charge(2)` and
+//! `charge(2.5)` both work.
 //!
 //! # Example
 //!
@@ -31,8 +35,8 @@
 //! println!("battery at {}%", telemetry.soc_pct);
 //!
 //! if caps.supports(Mode::ForceCharge) {
-//!     // Sugar for inv.apply(Command::charge(2_000.0)).
-//!     let applied = inv.charge(2_000.0).unwrap();
+//!     // Sugar for inv.apply(Command::charge(2)). Powers are kilowatts.
+//!     let applied = inv.charge(2).unwrap();
 //!     // How this command ends is data, not an assumption.
 //!     println!("expires: {:?}", applied.expiry);
 //! }
@@ -135,8 +139,8 @@ pub enum DischargeTarget {
 pub struct Command {
     /// What the inverter should do.
     pub mode: Mode,
-    /// Requested power in watts. Ignored for [`Mode::Passive`].
-    pub power_w: f64,
+    /// Requested power in kilowatts. Ignored for [`Mode::Passive`].
+    pub power_kw: f64,
     /// Where discharged energy should go. Ignored unless discharging.
     pub target: DischargeTarget,
     /// How long the caller wants the command to last.
@@ -155,37 +159,37 @@ impl Command {
     pub fn passive() -> Self {
         Command {
             mode: Mode::Passive,
-            power_w: 0.0,
+            power_kw: 0.0,
             target: DischargeTarget::HouseOnly,
             hold: DEFAULT_HOLD,
         }
     }
 
-    /// Charge at `power_w`, importing if necessary.
-    pub fn charge(power_w: f64) -> Self {
+    /// Charge at `power_kw`, importing if necessary.
+    pub fn charge(power_kw: impl Into<f64>) -> Self {
         Command {
             mode: Mode::ForceCharge,
-            power_w,
+            power_kw: power_kw.into(),
             target: DischargeTarget::HouseOnly,
             hold: DEFAULT_HOLD,
         }
     }
 
-    /// Discharge at `power_w` to cover household load, without exporting.
-    pub fn discharge(power_w: f64) -> Self {
+    /// Discharge at `power_kw` to cover household load, without exporting.
+    pub fn discharge(power_kw: impl Into<f64>) -> Self {
         Command {
             mode: Mode::ForceDischarge,
-            power_w,
+            power_kw: power_kw.into(),
             target: DischargeTarget::HouseOnly,
             hold: DEFAULT_HOLD,
         }
     }
 
-    /// Discharge at `power_w`, deliberately exporting to the grid.
-    pub fn export(power_w: f64) -> Self {
+    /// Discharge at `power_kw`, deliberately exporting to the grid.
+    pub fn export(power_kw: impl Into<f64>) -> Self {
         Command {
             mode: Mode::ForceDischarge,
-            power_w,
+            power_kw: power_kw.into(),
             target: DischargeTarget::GridExport,
             hold: DEFAULT_HOLD,
         }
@@ -202,9 +206,9 @@ impl Command {
         match (self.mode, self.target) {
             (Mode::Passive, _) => "passive".to_string(),
             (Mode::ForceDischarge, DischargeTarget::GridExport) => {
-                format!("force_discharge@{:.0}W(grid-export)", self.power_w)
+                format!("force_discharge@{}kW(grid-export)", self.power_kw)
             }
-            _ => format!("{}@{:.0}W", self.mode.as_str(), self.power_w),
+            _ => format!("{}@{}kW", self.mode.as_str(), self.power_kw),
         }
     }
 }
@@ -291,14 +295,14 @@ impl Capabilities {
 pub struct Telemetry {
     /// Battery state of charge, percent.
     pub soc_pct: f64,
-    /// Battery power, watts. Positive means charging.
-    pub battery_w: f64,
-    /// Grid power, watts. Positive means importing.
-    pub grid_w: f64,
-    /// Household consumption, watts.
-    pub load_w: f64,
-    /// PV generation, watts. `0.0` when the model cannot report it.
-    pub solar_w: f64,
+    /// Battery power, kilowatts. Positive means charging.
+    pub battery_kw: f64,
+    /// Grid power, kilowatts. Positive means importing.
+    pub grid_kw: f64,
+    /// Household consumption, kilowatts.
+    pub load_kw: f64,
+    /// PV generation, kilowatts. `0.0` when the model cannot report it.
+    pub solar_kw: f64,
     /// Wall-clock time of the reading, for display and storage.
     pub at: SystemTime,
     /// Monotonic time of the reading.
@@ -309,9 +313,9 @@ pub struct Telemetry {
 }
 
 impl Telemetry {
-    /// Power flowing out to the grid, watts. Zero while importing.
-    pub fn export_w(&self) -> f64 {
-        (-self.grid_w).max(0.0)
+    /// Power flowing out to the grid, kilowatts. Zero while importing.
+    pub fn export_kw(&self) -> f64 {
+        (-self.grid_kw).max(0.0)
     }
 
     /// How long ago this reading was taken.
@@ -329,8 +333,9 @@ pub struct Applied {
     /// weaker guarantee than requested; silently assuming otherwise is the
     /// mistake this type exists to prevent.
     pub expiry: Expiry,
-    /// Power the driver actually commanded, after any model-specific clamping.
-    pub power_w: f64,
+    /// Power the driver actually commanded, kilowatts, after any
+    /// model-specific clamping.
+    pub power_kw: f64,
 }
 
 /// An inverter this crate can talk to.
@@ -369,19 +374,19 @@ pub trait InverterExt: Inverter {
         self.apply(Command::passive())
     }
 
-    /// Charge at `power_w`, importing if necessary.
-    fn charge(&mut self, power_w: f64) -> Result<Applied, Error> {
-        self.apply(Command::charge(power_w))
+    /// Charge at `power_kw`, importing if necessary.
+    fn charge(&mut self, power_kw: impl Into<f64>) -> Result<Applied, Error> {
+        self.apply(Command::charge(power_kw))
     }
 
-    /// Discharge at `power_w` to cover household load, without exporting.
-    fn discharge(&mut self, power_w: f64) -> Result<Applied, Error> {
-        self.apply(Command::discharge(power_w))
+    /// Discharge at `power_kw` to cover household load, without exporting.
+    fn discharge(&mut self, power_kw: impl Into<f64>) -> Result<Applied, Error> {
+        self.apply(Command::discharge(power_kw))
     }
 
-    /// Discharge at `power_w`, deliberately exporting to the grid.
-    fn export(&mut self, power_w: f64) -> Result<Applied, Error> {
-        self.apply(Command::export(power_w))
+    /// Discharge at `power_kw`, deliberately exporting to the grid.
+    fn export(&mut self, power_kw: impl Into<f64>) -> Result<Applied, Error> {
+        self.apply(Command::export(power_kw))
     }
 }
 
@@ -409,25 +414,19 @@ mod tests {
 
     #[test]
     fn export_is_distinguishable_from_house_only_discharge() {
-        assert_eq!(
-            Command::discharge(1_000.0).target,
-            DischargeTarget::HouseOnly
-        );
-        assert_eq!(Command::export(1_000.0).target, DischargeTarget::GridExport);
-        assert!(Command::export(1_000.0).describe().contains("grid-export"));
+        assert_eq!(Command::discharge(1.5).target, DischargeTarget::HouseOnly);
+        assert_eq!(Command::export(3).target, DischargeTarget::GridExport);
+        assert!(Command::export(3).describe().contains("grid-export"));
     }
 
     #[test]
     fn describe_names_the_mode_power_and_export_intent() {
         assert_eq!(Command::passive().describe(), "passive");
-        assert_eq!(Command::charge(2_000.0).describe(), "force_charge@2000W");
+        assert_eq!(Command::charge(2).describe(), "force_charge@2kW");
+        assert_eq!(Command::discharge(1.5).describe(), "force_discharge@1.5kW");
         assert_eq!(
-            Command::discharge(1_500.0).describe(),
-            "force_discharge@1500W"
-        );
-        assert_eq!(
-            Command::export(3_000.0).describe(),
-            "force_discharge@3000W(grid-export)"
+            Command::export(3).describe(),
+            "force_discharge@3kW(grid-export)"
         );
     }
 
@@ -439,19 +438,26 @@ mod tests {
     }
 
     #[test]
-    fn export_w_is_the_positive_part_of_negative_grid_flow() {
+    fn export_kw_is_the_positive_part_of_negative_grid_flow() {
         let mut t = Telemetry {
             soc_pct: 50.0,
-            battery_w: 0.0,
-            grid_w: -300.0,
-            load_w: 0.0,
-            solar_w: 0.0,
+            battery_kw: 0.0,
+            grid_kw: -0.3,
+            load_kw: 0.0,
+            solar_kw: 0.0,
             at: SystemTime::now(),
             read_at: Instant::now(),
         };
-        assert_eq!(t.export_w(), 300.0);
-        t.grid_w = 200.0;
-        assert_eq!(t.export_w(), 0.0);
+        assert_eq!(t.export_kw(), 0.3);
+        t.grid_kw = 0.2;
+        assert_eq!(t.export_kw(), 0.0);
+    }
+
+    #[test]
+    fn integer_and_float_powers_build_the_same_command() {
+        assert_eq!(Command::charge(2), Command::charge(2.0));
+        assert_eq!(Command::discharge(1), Command::discharge(1.0));
+        assert_eq!(Command::export(3), Command::export(3.0));
     }
 
     #[test]
