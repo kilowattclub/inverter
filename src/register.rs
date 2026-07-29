@@ -170,4 +170,51 @@ mod tests {
         let wide = RegisterDef::holding("wide", 1).words(2);
         assert!(encode(&wide, 1.0).is_err());
     }
+
+    #[test]
+    fn constructors_set_the_register_table() {
+        assert_eq!(RegisterDef::input("i", 1).kind, RegKind::Input);
+        assert_eq!(RegisterDef::holding("h", 1).kind, RegKind::Holding);
+    }
+
+    #[test]
+    fn a_negative_scale_normalises_an_inverted_sign_convention() {
+        // How the FoxESS maps flip discharge-positive raw values.
+        let reg = RegisterDef::input("battery", 1).signed().scale(-1.0);
+        assert_eq!(decode(&reg, &[500]), -500.0);
+        assert_eq!(decode(&reg, &[(-500i16) as u16]), 500.0);
+    }
+
+    #[test]
+    fn decodes_the_full_unsigned_range_without_wrapping() {
+        let one = RegisterDef::input("one", 1);
+        assert_eq!(decode(&one, &[u16::MAX]), 65_535.0);
+        let two = RegisterDef::input("two", 1).words(2);
+        assert_eq!(decode(&two, &[u16::MAX, u16::MAX]), 4_294_967_295.0);
+    }
+
+    #[test]
+    fn encode_rounds_to_the_nearest_raw_unit() {
+        let reg = RegisterDef::holding("current", 1).scale(0.1);
+        assert_eq!(encode(&reg, 12.34).unwrap(), 123);
+        assert_eq!(encode(&reg, 12.38).unwrap(), 124);
+    }
+
+    #[test]
+    fn encode_accepts_the_signed_boundaries_exactly() {
+        let reg = RegisterDef::holding("setpoint", 1).signed();
+        assert_eq!(encode(&reg, i16::MAX as f64).unwrap(), 0x7FFF);
+        assert_eq!(encode(&reg, i16::MIN as f64).unwrap(), 0x8000);
+        assert!(encode(&reg, i16::MAX as f64 + 1.0).is_err());
+        assert!(encode(&reg, i16::MIN as f64 - 1.0).is_err());
+    }
+
+    #[test]
+    fn decode_then_encode_round_trips_scaled_values() {
+        let reg = RegisterDef::holding("current", 1).scale(0.1);
+        for raw in [0u16, 1, 703, 65_535] {
+            let value = decode(&reg, &[raw]);
+            assert_eq!(encode(&reg, value).unwrap(), raw);
+        }
+    }
 }

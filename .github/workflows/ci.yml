@@ -19,6 +19,9 @@ jobs:
       - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+      # The crate must stay publishable: packaging fails on missing metadata
+      # or files that don't build outside the repository.
+      - run: cargo package
 
   test:
     runs-on: ubuntu-latest

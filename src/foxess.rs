@@ -396,6 +396,45 @@ mod tests {
     }
 
     #[test]
+    fn the_maps_pin_the_community_documented_addresses() {
+        use crate::register::RegKind;
+
+        let g1 = &registers::H1_G1;
+        assert_eq!(g1.battery_soc.address, 11036);
+        assert_eq!(g1.battery_power.address, 11008);
+        assert_eq!(g1.grid_power.address, 11021);
+        assert_eq!(g1.load_power.address, 11023);
+        assert!(g1.pv_powers.iter().all(|reg| reg.kind == RegKind::Input));
+
+        let g2 = &registers::H1_G2;
+        assert_eq!(g2.battery_soc.address, 31024);
+        assert_eq!(g2.battery_power.address, 31022);
+        assert_eq!(g2.grid_power.address, 31014);
+        assert_eq!(g2.load_power.address, 31016);
+        assert!(g2.pv_powers.iter().all(|reg| reg.kind == RegKind::Holding));
+
+        for map in [g1, g2] {
+            assert_eq!(
+                map.battery_power.scale, -1.0,
+                "raw battery power is discharge-positive and must be negated"
+            );
+            assert_eq!(
+                map.grid_power.scale, -1.0,
+                "raw grid power is export-positive and must be negated"
+            );
+            assert!(map.battery_power.signed && map.grid_power.signed && map.load_power.signed);
+        }
+    }
+
+    #[test]
+    fn a_missing_pv_register_is_an_error_like_any_other() {
+        let mut bus = g2_fixture();
+        bus.holding.remove(&registers::H1_G2.pv_powers[1].address);
+        let mut inv = FoxEss::new(bus, &registers::H1_G2);
+        assert!(inv.read_telemetry().is_err());
+    }
+
+    #[test]
     fn remote_control_registers_are_recorded_but_unused() {
         // The write path is not implemented; the block is data for hardware
         // verification. The watchdog register is the whole point: it is what

@@ -418,6 +418,58 @@ mod tests {
     }
 
     #[test]
+    fn describe_names_the_mode_power_and_export_intent() {
+        assert_eq!(Command::passive().describe(), "passive");
+        assert_eq!(Command::charge(2_000.0).describe(), "force_charge@2000W");
+        assert_eq!(
+            Command::discharge(1_500.0).describe(),
+            "force_discharge@1500W"
+        );
+        assert_eq!(
+            Command::export(3_000.0).describe(),
+            "force_discharge@3000W(grid-export)"
+        );
+    }
+
+    #[test]
+    fn constructors_request_the_default_hold_unless_overridden() {
+        assert_eq!(Command::charge(1.0).hold, DEFAULT_HOLD);
+        let short = Command::charge(1.0).holding_for(Duration::from_secs(60));
+        assert_eq!(short.hold, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn export_w_is_the_positive_part_of_negative_grid_flow() {
+        let mut t = Telemetry {
+            soc_pct: 50.0,
+            battery_w: 0.0,
+            grid_w: -300.0,
+            load_w: 0.0,
+            solar_w: 0.0,
+            at: SystemTime::now(),
+            read_at: Instant::now(),
+        };
+        assert_eq!(t.export_w(), 300.0);
+        t.grid_w = 200.0;
+        assert_eq!(t.export_w(), 0.0);
+    }
+
+    #[test]
+    fn a_writable_driver_supports_only_its_listed_modes() {
+        let caps = Capabilities {
+            model: "test",
+            can_write: true,
+            modes: &[Mode::Passive, Mode::ForceCharge],
+            expiry: Expiry::UntilChanged,
+            reports_solar: false,
+            write_blocked_reason: None,
+        };
+        assert!(caps.supports(Mode::Passive));
+        assert!(caps.supports(Mode::ForceCharge));
+        assert!(!caps.supports(Mode::ForceDischarge));
+    }
+
+    #[test]
     fn capabilities_refuse_every_mode_when_the_driver_cannot_write() {
         let caps = Capabilities {
             model: "test",

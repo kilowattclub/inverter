@@ -115,9 +115,9 @@ timeout register the inverter counts down on its own, reverting to its
 programmed work mode when it expires. That means a verified write path can
 offer `Expiry::InverterTimeout` — a dead controller is safe by construction.
 The block's addresses and semantics are recorded as data in
-`foxess::registers::remote_control`, sourced from the
-[`nathanmarlor/foxess_modbus`](https://github.com/nathanmarlor/foxess_modbus)
-integration (MIT); they remain unverified on hardware, so writes stay closed.
+`foxess::registers::remote_control`, compiled from community documentation
+(sources are credited in the module docs); they remain unverified on
+hardware, so writes stay closed.
 
 ## Features
 

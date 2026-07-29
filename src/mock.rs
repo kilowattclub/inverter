@@ -211,6 +211,21 @@ mod tests {
     }
 
     #[test]
+    fn applied_power_is_clamped_to_the_inverter_limit() {
+        let mut inv = MockInverter::new().with_max_power_w(5_000.0);
+        let applied = inv.apply(Command::charge(50_000.0)).unwrap();
+        assert_eq!(applied.power_w, 5_000.0, "the clamp must be reported back");
+    }
+
+    #[test]
+    fn the_mock_advertises_a_dead_controller_safe_expiry() {
+        let inv = MockInverter::new();
+        let caps = inv.capabilities();
+        assert!(caps.can_write);
+        assert!(caps.expiry.is_dead_controller_safe());
+    }
+
+    #[test]
     fn charging_raises_the_state_of_charge() {
         let mut inv = MockInverter::new().with_soc_pct(50.0);
         inv.apply(Command::charge(1_000.0)).unwrap();

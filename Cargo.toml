@@ -5,8 +5,10 @@ edition = "2021"
 description = "Hybrid solar/battery inverter control: telemetry, modes, and honest command-expiry semantics"
 license = "MIT"
 repository = "https://github.com/kilowattclub/inverter"
+readme = "README.md"
 keywords = ["modbus", "inverter", "battery", "solar", "energy"]
 categories = ["embedded", "hardware-support"]
+include = ["/src", "/README.md", "/LICENSE"]
 
 [features]
 default = ["serial", "tcp", "foxess", "mock"]
