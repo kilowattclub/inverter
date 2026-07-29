@@ -43,7 +43,6 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub mod register;
 
-#[cfg(any(feature = "serial", feature = "tcp"))]
 pub mod modbus;
 
 #[cfg(feature = "foxess")]

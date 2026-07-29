@@ -2,20 +2,17 @@
 //!
 //! Two ways to reach the same registers: RTU over a serial adapter wired to
 //! the inverter, or TCP to a serial bridge sitting beside it. Drivers are
-//! written against [`ModbusBus`] and do not care which is in use.
+//! written against [`ModbusBus`] and do not care which is in use. The trait
+//! and its helpers are always compiled; the concrete transports sit behind
+//! the `serial` and `tcp` features.
 
-use std::io::{Read, Write};
-use std::time::{Duration, Instant};
-
-use rmodbus::client::ModbusRequest;
-use rmodbus::ModbusProto;
+use std::time::Duration;
 
 use crate::register::{RegKind, RegisterDef};
 use crate::Error;
 
 const RETRIES: u32 = 3;
 const BACKOFF: Duration = Duration::from_millis(500);
-const READ_DEADLINE: Duration = Duration::from_secs(3);
 
 /// A Modbus connection to one unit.
 pub trait ModbusBus: Send {
@@ -77,113 +74,137 @@ pub fn with_retries<B: ModbusBus + ?Sized, R>(
     Err(last_error.unwrap_or_else(|| Error::Comm("modbus operation failed".into())))
 }
 
-/// A byte stream carrying Modbus frames.
-trait ModbusStream: Read + Write + Send {
-    /// Drop buffered input left over from an abandoned transaction.
-    fn discard_input(&mut self) {}
-}
+#[cfg(any(feature = "serial", feature = "tcp"))]
+mod stream {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
 
-/// Modbus over any byte stream, framed by `proto`.
-struct StreamBus<S: ModbusStream> {
-    stream: S,
-    unit: u8,
-    proto: ModbusProto,
-}
+    use rmodbus::client::ModbusRequest;
+    use rmodbus::ModbusProto;
 
-impl<S: ModbusStream> StreamBus<S> {
-    fn transact<T>(
-        &mut self,
-        request: &[u8],
-        parse: impl FnOnce(&[u8]) -> Result<T, Error>,
-    ) -> Result<T, Error> {
-        // A timed-out transaction may leave bytes belonging to an earlier reply.
-        self.stream.discard_input();
-        self.stream
-            .write_all(request)
-            .map_err(|e| Error::Comm(format!("modbus write failed: {e}")))?;
-        self.stream
-            .flush()
-            .map_err(|e| Error::Comm(format!("modbus flush failed: {e}")))?;
+    use super::ModbusBus;
+    use crate::register::RegKind;
+    use crate::Error;
 
-        // Replies arrive in pieces; accumulate until the frame is complete.
-        let deadline = Instant::now() + READ_DEADLINE;
-        let mut buf: Vec<u8> = Vec::with_capacity(256);
-        let mut chunk = [0u8; 256];
-        loop {
-            let n = self
-                .stream
-                .read(&mut chunk)
-                .map_err(|e| Error::Comm(format!("modbus read failed: {e}")))?;
-            if n == 0 {
-                return Err(Error::Comm("empty modbus response".into()));
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if let Ok(frame_len) = rmodbus::guess_response_frame_len(&buf, self.proto) {
-                if buf.len() >= frame_len as usize {
-                    buf.truncate(frame_len as usize);
-                    break;
+    const READ_DEADLINE: Duration = Duration::from_secs(3);
+
+    /// A byte stream carrying Modbus frames.
+    pub(super) trait ModbusStream: Read + Write + Send {
+        /// Drop buffered input left over from an abandoned transaction.
+        fn discard_input(&mut self) {}
+    }
+
+    /// Modbus over any byte stream, framed by `proto`.
+    pub(super) struct StreamBus<S: ModbusStream> {
+        pub(super) stream: S,
+        pub(super) unit: u8,
+        pub(super) proto: ModbusProto,
+    }
+
+    impl<S: ModbusStream> StreamBus<S> {
+        fn transact<T>(
+            &mut self,
+            request: &[u8],
+            parse: impl FnOnce(&[u8]) -> Result<T, Error>,
+        ) -> Result<T, Error> {
+            // A timed-out transaction may leave bytes belonging to an earlier reply.
+            self.stream.discard_input();
+            self.stream
+                .write_all(request)
+                .map_err(|e| Error::Comm(format!("modbus write failed: {e}")))?;
+            self.stream
+                .flush()
+                .map_err(|e| Error::Comm(format!("modbus flush failed: {e}")))?;
+
+            // Replies arrive in pieces; accumulate until the frame is complete.
+            let deadline = Instant::now() + READ_DEADLINE;
+            let mut buf: Vec<u8> = Vec::with_capacity(256);
+            let mut chunk = [0u8; 256];
+            loop {
+                let n = self
+                    .stream
+                    .read(&mut chunk)
+                    .map_err(|e| Error::Comm(format!("modbus read failed: {e}")))?;
+                if n == 0 {
+                    return Err(Error::Comm("empty modbus response".into()));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Ok(frame_len) = rmodbus::guess_response_frame_len(&buf, self.proto) {
+                    if buf.len() >= frame_len as usize {
+                        buf.truncate(frame_len as usize);
+                        break;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Err(Error::Comm(format!(
+                        "incomplete modbus response ({} bytes) before deadline",
+                        buf.len()
+                    )));
                 }
             }
-            if Instant::now() >= deadline {
-                return Err(Error::Comm(format!(
-                    "incomplete modbus response ({} bytes) before deadline",
-                    buf.len()
-                )));
-            }
+            parse(&buf)
         }
-        parse(&buf)
+
+        fn read_registers(
+            &mut self,
+            kind: RegKind,
+            address: u16,
+            words: u8,
+        ) -> Result<Vec<u16>, Error> {
+            let mut builder = ModbusRequest::new(self.unit, self.proto);
+            let mut request = Vec::new();
+            let built = match kind {
+                RegKind::Input => builder.generate_get_inputs(address, words.into(), &mut request),
+                RegKind::Holding => {
+                    builder.generate_get_holdings(address, words.into(), &mut request)
+                }
+            };
+            built.map_err(|e| Error::Comm(format!("frame build failed: {e:?}")))?;
+            self.transact(&request, move |buf| {
+                let mut out = Vec::new();
+                builder
+                    .parse_u16(buf, &mut out)
+                    .map_err(|e| Error::Comm(format!("modbus read error at {address}: {e:?}")))?;
+                Ok(out)
+            })
+        }
     }
 
-    fn read_registers(
-        &mut self,
-        kind: RegKind,
-        address: u16,
-        words: u8,
-    ) -> Result<Vec<u16>, Error> {
-        let mut builder = ModbusRequest::new(self.unit, self.proto);
-        let mut request = Vec::new();
-        let built = match kind {
-            RegKind::Input => builder.generate_get_inputs(address, words.into(), &mut request),
-            RegKind::Holding => builder.generate_get_holdings(address, words.into(), &mut request),
-        };
-        built.map_err(|e| Error::Comm(format!("frame build failed: {e:?}")))?;
-        self.transact(&request, move |buf| {
-            let mut out = Vec::new();
+    impl<S: ModbusStream> ModbusBus for StreamBus<S> {
+        fn read_input(&mut self, address: u16, words: u8) -> Result<Vec<u16>, Error> {
+            self.read_registers(RegKind::Input, address, words)
+        }
+
+        fn read_holding(&mut self, address: u16, words: u8) -> Result<Vec<u16>, Error> {
+            self.read_registers(RegKind::Holding, address, words)
+        }
+
+        fn write_holding(&mut self, address: u16, value: u16) -> Result<(), Error> {
+            let mut builder = ModbusRequest::new(self.unit, self.proto);
+            let mut request = Vec::new();
             builder
-                .parse_u16(buf, &mut out)
-                .map_err(|e| Error::Comm(format!("modbus read error at {address}: {e:?}")))?;
-            Ok(out)
-        })
-    }
-}
-
-impl<S: ModbusStream> ModbusBus for StreamBus<S> {
-    fn read_input(&mut self, address: u16, words: u8) -> Result<Vec<u16>, Error> {
-        self.read_registers(RegKind::Input, address, words)
-    }
-
-    fn read_holding(&mut self, address: u16, words: u8) -> Result<Vec<u16>, Error> {
-        self.read_registers(RegKind::Holding, address, words)
-    }
-
-    fn write_holding(&mut self, address: u16, value: u16) -> Result<(), Error> {
-        let mut builder = ModbusRequest::new(self.unit, self.proto);
-        let mut request = Vec::new();
-        builder
-            .generate_set_holding(address, value, &mut request)
-            .map_err(|e| Error::Comm(format!("frame build failed: {e:?}")))?;
-        self.transact(&request, move |buf| {
-            builder
-                .parse_ok(buf)
-                .map_err(|e| Error::Comm(format!("modbus write error at {address}: {e:?}")))?;
-            Ok(())
-        })
+                .generate_set_holding(address, value, &mut request)
+                .map_err(|e| Error::Comm(format!("frame build failed: {e:?}")))?;
+            self.transact(&request, move |buf| {
+                builder
+                    .parse_ok(buf)
+                    .map_err(|e| Error::Comm(format!("modbus write error at {address}: {e:?}")))?;
+                Ok(())
+            })
+        }
     }
 }
 
 #[cfg(feature = "serial")]
 mod serial {
-    use super::*;
+    use std::io::{Read, Write};
+    use std::time::Duration;
+
+    use rmodbus::ModbusProto;
+
+    use super::stream::{ModbusStream, StreamBus};
+    use super::ModbusBus;
+    use crate::Error;
 
     struct SerialStream(Box<dyn serialport::SerialPort>);
 
@@ -250,8 +271,15 @@ pub use serial::SerialBus;
 
 #[cfg(feature = "tcp")]
 mod tcp {
-    use super::*;
+    use std::io::{Read, Write};
     use std::net::TcpStream;
+    use std::time::Duration;
+
+    use rmodbus::ModbusProto;
+
+    use super::stream::{ModbusStream, StreamBus};
+    use super::ModbusBus;
+    use crate::Error;
 
     struct TcpModbusStream(TcpStream);
 
