@@ -20,6 +20,7 @@
 //! # Example
 //!
 //! ```
+//! # #[cfg(feature = "mock")] {
 //! use inverter::{Command, Inverter, mock::MockInverter};
 //!
 //! let mut inv = MockInverter::new();
@@ -34,6 +35,7 @@
 //!     // How this command ends is data, not an assumption.
 //!     println!("expires: {:?}", applied.expiry);
 //! }
+//! # }
 //! ```
 
 #![forbid(unsafe_code)]
