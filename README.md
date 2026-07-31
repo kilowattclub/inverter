@@ -1,5 +1,9 @@
 # inverter
 
+[![CI](https://github.com/kilowattclub/inverter/actions/workflows/ci.yml/badge.svg)](https://github.com/kilowattclub/inverter/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/inverter.svg)](https://crates.io/crates/inverter)
+[![docs.rs](https://img.shields.io/docsrs/inverter)](https://docs.rs/inverter)
+
 Control hybrid solar/battery inverters over Modbus, from Rust.
 
 You open a driver, read telemetry from it, and call command methods on it.
@@ -8,6 +12,10 @@ inverter reverts by itself is a fail-safe, and a daily schedule that happens
 to end at the same time is not.
 
 ## Usage
+
+```sh
+cargo add inverter
+```
 
 ```rust
 use inverter::{Inverter, InverterExt, mock::MockInverter};
@@ -41,7 +49,8 @@ let mut inverter = FoxEss::open_serial("/dev/serial/by-id/usb-...", 9600, 247, &
 let mut inverter = FoxEss::open_tcp("10.0.0.5:502", 247, &registers::H1_G2)?;
 ```
 
-That's the whole model. Full API reference: `cargo doc --open`.
+That's the whole model. Full API reference: [docs.rs/inverter](https://docs.rs/inverter).
+Runnable walkthrough: `cargo run --example tour`.
 
 ## What each command does
 
@@ -126,10 +135,11 @@ let soc = inverter.soc_pct()?;
 let export = inverter.export_kw()?;
 ```
 
-`inverter.mode()?` asks which [`Mode`] is currently in force. A driver that
+`inverter.mode()?` asks which `Mode` is currently in force. A driver that
 cannot read that back from the hardware errors instead of repeating its last
 command — a stale answer would hide an expired or externally-changed
-command. The mock answers exactly (it simulates the timeout); FoxESS is
+command — and `capabilities().reports_mode` says up front whether it can
+answer. The mock answers exactly (it simulates the timeout); FoxESS is
 `Unsupported` until its remote-control registers are verified readable.
 
 ## Commands as data
@@ -176,6 +186,9 @@ with addresses kept as data via `register::RegisterDef` — see the
 builds and is tested in CI. The crate is synchronous by design: Modbus over
 a serial line does not benefit from async, and a blocking API keeps a
 runtime out of your dependency tree.
+
+The minimum supported Rust version is **1.85**, checked in CI; it is set by
+the serial stack's dependencies, not by this crate's own code.
 
 ## Safety
 
