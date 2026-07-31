@@ -21,13 +21,14 @@
 //! The H1's remote-control block (see [`registers::remote_control`]) carries
 //! a genuine watchdog: a timeout register the inverter counts down on its own
 //! and, on expiry, reverts to its programmed work mode. A verified write path
-//! can therefore offer [`Expiry::InverterTimeout`] — a dead controller leaves
-//! the inverter reverting by itself. That answer comes from reading
-//! `foxess_modbus`; it still needs proving on hardware before writes open.
+//! can therefore offer [`Expiry::InverterTimeout`](crate::Expiry::InverterTimeout)
+//! — a dead controller leaves the inverter reverting by itself. That answer
+//! comes from reading `foxess_modbus`; it still needs proving on hardware
+//! before writes open.
 
 use crate::modbus::{read_words, with_retries, ModbusBus};
 use crate::register::{decode, RegisterDef};
-use crate::{Applied, Capabilities, Command, Error, Expiry, Inverter, Mode, Telemetry};
+use crate::{Applied, Capabilities, Command, Error, Inverter, Mode, Telemetry};
 use std::time::{Instant, SystemTime};
 
 const LOG_TARGET: &str = "inverter.foxess";
@@ -202,17 +203,12 @@ impl FoxEss<crate::modbus::TcpBus> {
 
 impl<B: ModbusBus> Inverter for FoxEss<B> {
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            model: self.map.model,
-            can_write: false,
-            modes: &[],
-            // Nothing is commanded, so nothing expires. A verified write path
-            // built on the remote-control watchdog would report
-            // InverterTimeout - see the registers::remote_control docs.
-            expiry: Expiry::UntilChanged,
-            reports_solar: !self.map.pv_powers.is_empty(),
-            write_blocked_reason: Some(WRITE_BLOCKED),
-        }
+        // A verified write path built on the remote-control watchdog would
+        // become writable with InverterTimeout expiry and mode read-back -
+        // see the registers::remote_control docs.
+        let mut caps = Capabilities::read_only(self.map.model, WRITE_BLOCKED);
+        caps.reports_solar = !self.map.pv_powers.is_empty();
+        caps
     }
 
     fn read_telemetry(&mut self) -> Result<Telemetry, Error> {
@@ -240,8 +236,7 @@ impl<B: ModbusBus> Inverter for FoxEss<B> {
 
     fn apply(&mut self, command: Command) -> Result<Applied, Error> {
         Err(Error::Unsupported(format!(
-            "{WRITE_BLOCKED} (refused: {})",
-            command.describe()
+            "{WRITE_BLOCKED} (refused: {command})"
         )))
     }
 
@@ -249,7 +244,8 @@ impl<B: ModbusBus> Inverter for FoxEss<B> {
         // The imposed state lives in the unverified remote-control block, and
         // repeating a guess would hide an expired or app-driven change.
         Err(Error::Unsupported(
-            "FoxESS mode read-back is not implemented: the remote-control              registers are unverified"
+            "FoxESS mode read-back is not implemented: \
+             the remote-control registers are unverified"
                 .into(),
         ))
     }
@@ -373,6 +369,7 @@ mod tests {
             assert!(!caps.can_write);
             assert!(caps.write_blocked_reason.is_some());
             assert!(caps.reports_solar);
+            assert!(!caps.reports_mode, "mode() cannot answer until verified");
             for mode in INTENDED_MODES {
                 assert!(!caps.supports(*mode), "{mode:?} must not be advertised");
             }

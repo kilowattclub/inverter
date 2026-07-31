@@ -24,31 +24,36 @@
 //! # Example
 //!
 //! ```
-//! # #[cfg(feature = "mock")] {
+//! # #[cfg(feature = "mock")]
+//! # fn main() -> Result<(), inverter::Error> {
 //! use inverter::{Inverter, InverterExt, Mode, mock::MockInverter};
 //!
 //! let mut inv = MockInverter::new();
 //! let caps = inv.capabilities();
 //! assert!(caps.can_write);
 //!
-//! let telemetry = inv.read_telemetry().unwrap();
+//! let telemetry = inv.read_telemetry()?;
 //! println!("battery at {}%", telemetry.soc_pct);
 //!
 //! // Or single values, and the mode currently in force:
-//! let soc = inv.soc_pct().unwrap();
-//! assert_eq!(inv.mode().unwrap(), Mode::Passive);
+//! let soc = inv.soc_pct()?;
+//! assert_eq!(inv.mode()?, Mode::Passive);
 //!
 //! if caps.supports(Mode::ForceCharge) {
 //!     // Sugar for inv.apply(Command::charge(2)). Powers are kilowatts.
-//!     let applied = inv.charge(2).unwrap();
+//!     let applied = inv.charge(2)?;
 //!     // How this command ends is data, not an assumption.
 //!     println!("expires: {:?}", applied.expiry);
 //! }
+//! # Ok(())
 //! # }
+//! # #[cfg(not(feature = "mock"))]
+//! # fn main() {}
 //! ```
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -126,6 +131,10 @@ pub enum Mode {
 
 impl Mode {
     /// Stable lowercase identifier, for logs and configuration.
+    ///
+    /// [`Display`](std::fmt::Display) prints the same identifier; parse it
+    /// back with [`str::parse`].
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Mode::Passive => "passive",
@@ -133,15 +142,29 @@ impl Mode {
             Mode::ForceDischarge => "force_discharge",
         }
     }
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The error from parsing a string that names no [`Mode`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(r#"unrecognised mode {0:?}: expected "passive", "force_charge" or "force_discharge""#)]
+pub struct ParseModeError(String);
+
+impl std::str::FromStr for Mode {
+    type Err = ParseModeError;
 
     /// Parse the identifier produced by [`Mode::as_str`].
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Mode> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "passive" => Some(Mode::Passive),
-            "force_charge" => Some(Mode::ForceCharge),
-            "force_discharge" => Some(Mode::ForceDischarge),
-            _ => None,
+            "passive" => Ok(Mode::Passive),
+            "force_charge" => Ok(Mode::ForceCharge),
+            "force_discharge" => Ok(Mode::ForceDischarge),
+            _ => Err(ParseModeError(s.to_string())),
         }
     }
 }
@@ -151,7 +174,7 @@ impl Mode {
 /// This is a target, not a permission: the caller decides policy. It is part
 /// of the command because some inverters reach the two behaviours through
 /// different work modes rather than through a power limit.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum DischargeTarget {
     /// Cover household load only; do not push power out to the grid.
     HouseOnly,
@@ -175,65 +198,74 @@ pub struct Command {
     pub hold: Duration,
 }
 
-/// Default hold for the convenience constructors: long enough to survive a
-/// missed control tick, short enough that a dead controller stops mattering.
-pub const DEFAULT_HOLD: Duration = Duration::from_secs(300);
-
 impl Command {
+    /// Hold requested by the convenience constructors: long enough to survive
+    /// a missed control tick, short enough that a dead controller stops
+    /// mattering. Override it with [`Command::holding_for`].
+    pub const DEFAULT_HOLD: Duration = Duration::from_secs(300);
+
     /// Return to the inverter's own self-use behaviour ([`Mode::Passive`]).
+    #[must_use]
     pub fn passive() -> Self {
         Command {
             mode: Mode::Passive,
             power_kw: 0.0,
             target: DischargeTarget::HouseOnly,
-            hold: DEFAULT_HOLD,
+            hold: Self::DEFAULT_HOLD,
         }
     }
 
     /// Charge at `power_kw`, importing if necessary.
+    #[must_use]
     pub fn charge(power_kw: impl Into<f64>) -> Self {
         Command {
             mode: Mode::ForceCharge,
             power_kw: power_kw.into(),
             target: DischargeTarget::HouseOnly,
-            hold: DEFAULT_HOLD,
+            hold: Self::DEFAULT_HOLD,
         }
     }
 
     /// Discharge at `power_kw` to cover household load, without exporting.
+    #[must_use]
     pub fn discharge(power_kw: impl Into<f64>) -> Self {
         Command {
             mode: Mode::ForceDischarge,
             power_kw: power_kw.into(),
             target: DischargeTarget::HouseOnly,
-            hold: DEFAULT_HOLD,
+            hold: Self::DEFAULT_HOLD,
         }
     }
 
     /// Discharge at `power_kw`, deliberately exporting to the grid.
+    #[must_use]
     pub fn export(power_kw: impl Into<f64>) -> Self {
         Command {
             mode: Mode::ForceDischarge,
             power_kw: power_kw.into(),
             target: DischargeTarget::GridExport,
-            hold: DEFAULT_HOLD,
+            hold: Self::DEFAULT_HOLD,
         }
     }
 
     /// Ask the inverter to hold this command for `hold` rather than the default.
+    #[must_use]
     pub fn holding_for(mut self, hold: Duration) -> Self {
         self.hold = hold;
         self
     }
+}
 
-    /// Human-readable form for logs.
-    pub fn describe(&self) -> String {
+impl std::fmt::Display for Command {
+    /// Log-friendly form: `passive`, `force_charge@2kW`,
+    /// `force_discharge@3kW(grid-export)`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match (self.mode, self.target) {
-            (Mode::Passive, _) => "passive".to_string(),
+            (Mode::Passive, _) => f.write_str("passive"),
             (Mode::ForceDischarge, DischargeTarget::GridExport) => {
-                format!("force_discharge@{}kW(grid-export)", self.power_kw)
+                write!(f, "force_discharge@{}kW(grid-export)", self.power_kw)
             }
-            _ => format!("{}@{}kW", self.mode.as_str(), self.power_kw),
+            _ => write!(f, "{}@{}kW", self.mode, self.power_kw),
         }
     }
 }
@@ -245,7 +277,7 @@ impl Command {
 /// [`Expiry::InverterTimeout`] has built a system that keeps forcing a
 /// battery after the controller is gone — every day, at the same time, until
 /// someone notices.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Expiry {
     /// The inverter reverts by itself after this long, once, without repeating.
     ///
@@ -276,6 +308,7 @@ impl Expiry {
     ///
     /// Callers that can only tolerate a genuine dead-man's handle should refuse
     /// to issue non-passive commands when this is `false`.
+    #[must_use]
     pub fn is_dead_controller_safe(&self) -> bool {
         matches!(self, Expiry::InverterTimeout(_))
     }
@@ -286,7 +319,12 @@ impl Expiry {
 /// Ask before you command. Feature support varies by model *and* by how the
 /// inverter is connected — the same unit over RS485 and over its own network
 /// module does not expose the same registers.
-#[derive(Clone, Debug)]
+///
+/// The struct is `#[non_exhaustive]` so capabilities can grow without
+/// breaking callers. Drivers outside this crate therefore build it through
+/// [`Capabilities::read_only`] or [`Capabilities::writable`] and then set the
+/// public reporting fields directly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]
 pub struct Capabilities {
     /// Human-readable model or map identifier, for logs and diagnostics.
@@ -302,12 +340,70 @@ pub struct Capabilities {
     pub expiry: Expiry,
     /// Whether the driver can report PV generation.
     pub reports_solar: bool,
+    /// Whether [`Inverter::mode`] can answer, rather than returning
+    /// [`Error::Unsupported`].
+    pub reports_mode: bool,
     /// Why writes are unavailable, when `can_write` is false.
     pub write_blocked_reason: Option<&'static str>,
 }
 
 impl Capabilities {
+    /// A driver that reports telemetry but refuses every command.
+    ///
+    /// `reason` is surfaced through [`Capabilities::write_blocked_reason`] so
+    /// a caller can log *why* writes are unavailable instead of a bare
+    /// "unsupported". The reporting flags start `false`; set the public
+    /// fields for whatever the driver can do:
+    ///
+    /// ```
+    /// use inverter::Capabilities;
+    ///
+    /// let mut caps = Capabilities::read_only("Acme X1 (RS485)", "map unverified on hardware");
+    /// caps.reports_solar = true;
+    /// assert!(!caps.can_write);
+    /// ```
+    #[must_use]
+    pub fn read_only(model: &'static str, reason: &'static str) -> Self {
+        Capabilities {
+            model,
+            can_write: false,
+            modes: &[],
+            // Nothing can be commanded, so nothing this driver does expires.
+            expiry: Expiry::UntilChanged,
+            reports_solar: false,
+            reports_mode: false,
+            write_blocked_reason: Some(reason),
+        }
+    }
+
+    /// A driver that can command `modes`, each ending the way `expiry` says.
+    ///
+    /// The reporting flags start `false`; set the public fields for whatever
+    /// the driver can do.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `modes` contains [`Mode::Passive`]: a writable driver
+    /// that cannot step out of the way leaves callers with no safe fallback.
+    #[must_use]
+    pub fn writable(model: &'static str, modes: &'static [Mode], expiry: Expiry) -> Self {
+        assert!(
+            modes.contains(&Mode::Passive),
+            "a writable driver must support Mode::Passive"
+        );
+        Capabilities {
+            model,
+            can_write: true,
+            modes,
+            expiry,
+            reports_solar: false,
+            reports_mode: false,
+            write_blocked_reason: None,
+        }
+    }
+
     /// Whether `mode` can be commanded.
+    #[must_use]
     pub fn supports(&self, mode: Mode) -> bool {
         self.can_write && self.modes.contains(&mode)
     }
@@ -316,7 +412,7 @@ impl Capabilities {
 /// A reading from the inverter.
 ///
 /// See the [crate] docs for sign conventions.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Telemetry {
     /// Battery state of charge, percent.
     pub soc_pct: f64,
@@ -339,18 +435,20 @@ pub struct Telemetry {
 
 impl Telemetry {
     /// Power flowing out to the grid, kilowatts. Zero while importing.
+    #[must_use]
     pub fn export_kw(&self) -> f64 {
         (-self.grid_kw).max(0.0)
     }
 
     /// How long ago this reading was taken.
+    #[must_use]
     pub fn age(&self) -> Duration {
         self.read_at.elapsed()
     }
 }
 
 /// What the inverter accepted, which may be less than what was asked for.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Applied {
     /// How this command will actually end.
     ///
@@ -388,6 +486,7 @@ pub trait Inverter: Send {
     /// back from the hardware returns [`Error::Unsupported`] rather than
     /// repeating what it last commanded — a stale belief is exactly the
     /// mistake that hides an expired or externally-changed command.
+    /// [`Capabilities::reports_mode`] says up front whether this can answer.
     fn mode(&mut self) -> Result<Mode, Error>;
 
     /// Release the transport. Called once, on shutdown.
@@ -397,7 +496,7 @@ pub trait Inverter: Send {
 /// Partial applications of the [`Inverter`] operations.
 ///
 /// Sugar only, in two groups. The command methods each build the matching
-/// [`Command`] with [`DEFAULT_HOLD`] and call [`Inverter::apply`]; for a
+/// [`Command`] with [`Command::DEFAULT_HOLD`] and call [`Inverter::apply`]; for a
 /// non-default hold, build the [`Command`] and call `apply` directly. The
 /// telemetry methods each perform a **full** [`Inverter::read_telemetry`]
 /// and return one field — convenient for a one-off check, wasteful in a
@@ -470,9 +569,11 @@ mod tests {
     #[test]
     fn mode_round_trips_through_its_identifier() {
         for mode in [Mode::Passive, Mode::ForceCharge, Mode::ForceDischarge] {
-            assert_eq!(Mode::from_str(mode.as_str()), Some(mode));
+            assert_eq!(mode.as_str().parse(), Ok(mode));
+            assert_eq!(mode.to_string(), mode.as_str(), "Display matches as_str");
         }
-        assert_eq!(Mode::from_str("nonsense"), None);
+        let err = "nonsense".parse::<Mode>().unwrap_err();
+        assert!(err.to_string().contains("nonsense"), "{err}");
     }
 
     #[test]
@@ -487,23 +588,23 @@ mod tests {
     fn export_is_distinguishable_from_house_only_discharge() {
         assert_eq!(Command::discharge(1.5).target, DischargeTarget::HouseOnly);
         assert_eq!(Command::export(3).target, DischargeTarget::GridExport);
-        assert!(Command::export(3).describe().contains("grid-export"));
+        assert!(Command::export(3).to_string().contains("grid-export"));
     }
 
     #[test]
-    fn describe_names_the_mode_power_and_export_intent() {
-        assert_eq!(Command::passive().describe(), "passive");
-        assert_eq!(Command::charge(2).describe(), "force_charge@2kW");
-        assert_eq!(Command::discharge(1.5).describe(), "force_discharge@1.5kW");
+    fn display_names_the_mode_power_and_export_intent() {
+        assert_eq!(Command::passive().to_string(), "passive");
+        assert_eq!(Command::charge(2).to_string(), "force_charge@2kW");
+        assert_eq!(Command::discharge(1.5).to_string(), "force_discharge@1.5kW");
         assert_eq!(
-            Command::export(3).describe(),
+            Command::export(3).to_string(),
             "force_discharge@3kW(grid-export)"
         );
     }
 
     #[test]
     fn constructors_request_the_default_hold_unless_overridden() {
-        assert_eq!(Command::charge(1.0).hold, DEFAULT_HOLD);
+        assert_eq!(Command::charge(1.0).hold, Command::DEFAULT_HOLD);
         let short = Command::charge(1.0).holding_for(Duration::from_secs(60));
         assert_eq!(short.hold, Duration::from_secs(60));
     }
@@ -533,17 +634,21 @@ mod tests {
 
     #[test]
     fn a_writable_driver_supports_only_its_listed_modes() {
-        let caps = Capabilities {
-            model: "test",
-            can_write: true,
-            modes: &[Mode::Passive, Mode::ForceCharge],
-            expiry: Expiry::UntilChanged,
-            reports_solar: false,
-            write_blocked_reason: None,
-        };
+        let caps = Capabilities::writable(
+            "test",
+            &[Mode::Passive, Mode::ForceCharge],
+            Expiry::UntilChanged,
+        );
         assert!(caps.supports(Mode::Passive));
         assert!(caps.supports(Mode::ForceCharge));
         assert!(!caps.supports(Mode::ForceDischarge));
+        assert_eq!(caps.write_blocked_reason, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "must support Mode::Passive")]
+    fn a_writable_driver_without_passive_is_rejected_outright() {
+        let _ = Capabilities::writable("test", &[Mode::ForceCharge], Expiry::UntilChanged);
     }
 
     #[test]
@@ -551,12 +656,23 @@ mod tests {
         let caps = Capabilities {
             model: "test",
             can_write: false,
+            // Listed modes must not leak through while writes are off.
             modes: &[Mode::Passive, Mode::ForceCharge],
             expiry: Expiry::UntilChanged,
             reports_solar: false,
+            reports_mode: false,
             write_blocked_reason: Some("unverified map"),
         };
         assert!(!caps.supports(Mode::Passive));
         assert!(!caps.supports(Mode::ForceCharge));
+    }
+
+    #[test]
+    fn a_read_only_driver_carries_its_reason_and_reports_nothing_extra() {
+        let caps = Capabilities::read_only("test", "map unverified");
+        assert!(!caps.can_write);
+        assert_eq!(caps.write_blocked_reason, Some("map unverified"));
+        assert!(!caps.reports_solar && !caps.reports_mode);
+        assert!(!caps.supports(Mode::Passive));
     }
 }
