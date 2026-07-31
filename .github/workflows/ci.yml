@@ -30,6 +30,16 @@ jobs:
       - run: rustup update --no-self-update stable
       - run: cargo test --all-features
 
+  # The declared rust-version must keep compiling. This resolves dependencies
+  # fresh, so it also catches a transitive dependency raising the floor.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.85 --profile minimal --no-self-update
+      - run: rustup default 1.85
+      - run: cargo check --all-targets --all-features
+
   # Every feature must build and pass clippy on its own: downstream users
   # pick and choose, and an untested combination is a broken one.
   features:

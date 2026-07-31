@@ -2,13 +2,23 @@
 name = "inverter"
 version = "0.1.0"
 edition = "2021"
+# MSRV is capped by serialport's dependency tree (edition 2024); the crate's
+# own code needs much less. Checked by the `msrv` CI job — bump consciously.
+rust-version = "1.85"
+# Resolve dependencies MSRV-aware, so the msrv job fails on our code, not on
+# a transitive dependency that raised its floor overnight.
+resolver = "3"
 description = "Hybrid solar/battery inverter control: telemetry, modes, and honest command-expiry semantics"
 license = "MIT"
 repository = "https://github.com/kilowattclub/inverter"
 readme = "README.md"
 keywords = ["modbus", "inverter", "battery", "solar", "energy"]
-categories = ["embedded", "hardware-support"]
-include = ["/src", "/README.md", "/LICENSE"]
+categories = ["hardware-support", "network-programming"]
+include = ["/src", "/examples", "/README.md", "/CHANGELOG.md", "/LICENSE"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["serial", "tcp", "foxess", "mock"]
@@ -24,3 +34,11 @@ thiserror = "2"
 # A fixed serial port needs no hotplug enumeration; disabling the default
 # `libudev` feature avoids a build dependency on libudev-dev.
 serialport = { version = "4", default-features = false, optional = true }
+
+[[example]]
+name = "tour"
+required-features = ["mock"]
+
+[[example]]
+name = "foxess_read"
+required-features = ["foxess", "serial", "tcp"]
