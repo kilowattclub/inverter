@@ -27,8 +27,8 @@ let mut inverter = MockInverter::new();
 let t = inverter.read_telemetry()?;
 println!("{:.0}%  battery {:+.2} kW  grid {:+.2} kW", t.soc_pct, t.battery_kw, t.grid_kw);
 
-let soc = inverter.soc_pct()?;    // one field, one call
-let mode = inverter.mode()?;      // the Mode currently in force
+let soc = inverter.get_soc_pct()?;    // one field, one call
+let mode = inverter.get_mode()?;      // the Mode currently in force
 
 // 3. Command it. Powers are kilowatts; int or float both work:
 inverter.charge(2)?;        // charge at 2 kW, importing if needed
@@ -126,16 +126,17 @@ come from every driver, whatever the inverter's native convention:
 `t.export_kw()` gives grid export as a positive number; `t.age()` is a
 monotonic staleness check that NTP steps cannot corrupt.
 
-For a one-off value there are single-field methods — sugar over
+For a one-off value there are `get_*` methods — sugar over
 `read_telemetry`, so each call performs a full read; batch with
-`read_telemetry` when you need several:
+`read_telemetry` when you need several. The prefix marks the cost:
+`get_*` talks to hardware, plain accessors on `Telemetry` are free.
 
 ```rust
-let soc = inverter.soc_pct()?;
-let export = inverter.export_kw()?;
+let soc = inverter.get_soc_pct()?;
+let export = inverter.get_export_kw()?;
 ```
 
-`inverter.mode()?` asks which `Mode` is currently in force. A driver that
+`inverter.get_mode()?` asks which `Mode` is currently in force. A driver that
 cannot read that back from the hardware errors instead of repeating its last
 command — a stale answer would hide an expired or externally-changed
 command — and `capabilities().reports_mode` says up front whether it can

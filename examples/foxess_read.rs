@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("solar:   {:>6.2} kW", t.solar_kw);
 
     // Single-value sugar performs a full read; fine for a one-off check.
-    println!("export:  {:>6.2} kW", inverter.export_kw()?);
+    println!("export:  {:>6.2} kW", inverter.get_export_kw()?);
     Ok(())
 }
 

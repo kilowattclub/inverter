@@ -264,12 +264,12 @@ mod tests {
         let t = inv.read_telemetry().unwrap();
         // The simulation steps by real elapsed time, so SoC drifts a hair
         // between reads; the powers are functions of the command and config.
-        assert!((inv.soc_pct().unwrap() - t.soc_pct).abs() < 1e-6);
-        assert_eq!(inv.battery_kw().unwrap(), t.battery_kw);
-        assert_eq!(inv.grid_kw().unwrap(), t.grid_kw);
-        assert_eq!(inv.load_kw().unwrap(), t.load_kw);
-        assert_eq!(inv.solar_kw().unwrap(), t.solar_kw);
-        assert_eq!(inv.export_kw().unwrap(), t.export_kw());
+        assert!((inv.get_soc_pct().unwrap() - t.soc_pct).abs() < 1e-6);
+        assert_eq!(inv.get_battery_kw().unwrap(), t.battery_kw);
+        assert_eq!(inv.get_grid_kw().unwrap(), t.grid_kw);
+        assert_eq!(inv.get_load_kw().unwrap(), t.load_kw);
+        assert_eq!(inv.get_solar_kw().unwrap(), t.solar_kw);
+        assert_eq!(inv.get_export_kw().unwrap(), t.export_kw());
     }
 
     #[test]

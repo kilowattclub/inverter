@@ -36,8 +36,8 @@
 //! println!("battery at {}%", telemetry.soc_pct);
 //!
 //! // Or single values, and the mode currently in force:
-//! let soc = inv.soc_pct()?;
-//! assert_eq!(inv.mode()?, Mode::Passive);
+//! let soc = inv.get_soc_pct()?;
+//! assert_eq!(inv.get_mode()?, Mode::Passive);
 //!
 //! if caps.supports(Mode::ForceCharge) {
 //!     // Sugar for inv.apply(Command::charge(2)). Powers are kilowatts.
@@ -53,7 +53,9 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+// `doc_auto_cfg` was merged into `doc_cfg` in Rust 1.92; the automatic
+// feature-requirement banners on docs.rs come from this single gate now.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -498,9 +500,11 @@ pub trait Inverter: Send {
 /// Sugar only, in two groups. The command methods each build the matching
 /// [`Command`] with [`Command::DEFAULT_HOLD`] and call [`Inverter::apply`]; for a
 /// non-default hold, build the [`Command`] and call `apply` directly. The
-/// telemetry methods each perform a **full** [`Inverter::read_telemetry`]
-/// and return one field — convenient for a one-off check, wasteful in a
-/// loop; when you need several values, read once and use the fields.
+/// `get_*` methods each perform a **full** [`Inverter::read_telemetry`] (or
+/// [`Inverter::mode`]) and return one value — convenient for a one-off
+/// check, wasteful in a loop; when you need several values, read once and
+/// use the fields. The prefix marks the cost: `get_*` talks to hardware,
+/// while same-named accessors on [`Telemetry`] are free field reads.
 ///
 /// The blanket implementation is the only one the coherence rules allow, so
 /// no driver can override these — every spelling reaches hardware through
@@ -527,36 +531,43 @@ pub trait InverterExt: Inverter {
     }
 
     /// Battery state of charge, percent. Performs a full telemetry read.
-    fn soc_pct(&mut self) -> Result<f64, Error> {
+    fn get_soc_pct(&mut self) -> Result<f64, Error> {
         Ok(self.read_telemetry()?.soc_pct)
     }
 
     /// Battery power, kilowatts; positive means charging. Performs a full
     /// telemetry read.
-    fn battery_kw(&mut self) -> Result<f64, Error> {
+    fn get_battery_kw(&mut self) -> Result<f64, Error> {
         Ok(self.read_telemetry()?.battery_kw)
     }
 
     /// Grid power, kilowatts; positive means importing. Performs a full
     /// telemetry read.
-    fn grid_kw(&mut self) -> Result<f64, Error> {
+    fn get_grid_kw(&mut self) -> Result<f64, Error> {
         Ok(self.read_telemetry()?.grid_kw)
     }
 
     /// Household consumption, kilowatts. Performs a full telemetry read.
-    fn load_kw(&mut self) -> Result<f64, Error> {
+    fn get_load_kw(&mut self) -> Result<f64, Error> {
         Ok(self.read_telemetry()?.load_kw)
     }
 
     /// PV generation, kilowatts. Performs a full telemetry read.
-    fn solar_kw(&mut self) -> Result<f64, Error> {
+    fn get_solar_kw(&mut self) -> Result<f64, Error> {
         Ok(self.read_telemetry()?.solar_kw)
     }
 
     /// Grid export, kilowatts; zero while importing. Performs a full
     /// telemetry read.
-    fn export_kw(&mut self) -> Result<f64, Error> {
+    fn get_export_kw(&mut self) -> Result<f64, Error> {
         Ok(self.read_telemetry()?.export_kw())
+    }
+
+    /// The [`Mode`] currently in force — the `get_*` spelling of
+    /// [`Inverter::mode`], with the same contract: drivers that cannot read
+    /// it back honestly error rather than guessing.
+    fn get_mode(&mut self) -> Result<Mode, Error> {
+        self.mode()
     }
 }
 

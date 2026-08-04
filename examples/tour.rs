@@ -44,7 +44,7 @@ fn main() -> Result<(), inverter::Error> {
     // inverter has reverted by itself — no controller involved. That is
     // what a real fail-safe looks like.
     inverter.advance(Duration::from_secs(360));
-    println!("later:    mode is {} again", inverter.mode()?);
+    println!("later:    mode is {} again", inverter.get_mode()?);
 
     // Commands are also plain data, for planners and safety layers; build
     // one explicitly to ask for a non-default hold.

@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-08-02
+
+### Changed
+
+- The single-value `InverterExt` reads are now spelled `get_*`
+  (`get_soc_pct`, `get_battery_kw`, `get_grid_kw`, `get_load_kw`,
+  `get_solar_kw`, `get_export_kw`), and `get_mode` joins them as the sugar
+  spelling of `Inverter::mode`. The prefix marks the cost: `get_*` performs
+  a hardware read, while the same-named accessors on `Telemetry` are free
+  field reads.
+
+### Fixed
+
+- docs.rs failed to build 0.1.0: the `doc_auto_cfg` nightly feature was
+  removed in Rust 1.92 (merged into `doc_cfg`), and the attribute is only
+  active under docs.rs's `--cfg docsrs`, so no other build saw it. The gate
+  now uses `doc_cfg`.
+
 ## [0.1.0] - 2026-08-02
 
 The initial release.
