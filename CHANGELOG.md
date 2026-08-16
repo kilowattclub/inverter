@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-08-17
+
+### Added
+
+- `MockInverter::with_waveshare_relay` and `RelayMockInverter` optionally
+  display passive, charge, house-discharge and grid-export commands on a
+  Waveshare Modbus RTU Relay 4CH. Writes are read back, TTL expiry returns the
+  indicator to passive, and `close` switches every channel off.
+
 ## [0.3.0] - 2026-08-16
 
 ### Changed

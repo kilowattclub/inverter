@@ -180,7 +180,7 @@ closing the inverter rather than waiting for the hardware timeout.
 
 | Driver | Reads | Writes | Notes |
 |---|---|---|---|
-| `mock` | ✅ | ✅ | Full simulation with a real one-shot timeout; builders for capacity, SoC, load, solar |
+| `mock` | ✅ | ✅ | Full simulation with a real one-shot timeout; optional Waveshare 4CH relay indicator with `serial` |
 | `foxess` | ⚠️ community map | ✅ native timeout | H1 G1 (`registers::H1_G1`) and G2 (`registers::H1_G2`) over RS485 |
 
 FoxESS commands use its remote-control registers with Modbus function 6. The
@@ -210,6 +210,11 @@ with addresses kept as data via `register::RegisterDef` — see the
 builds and is tested in CI. The crate is synchronous by design: Modbus over
 a serial line does not benefit from async, and a blocking API keeps a
 runtime out of your dependency tree.
+
+With both `mock` and `serial`, call `MockInverter::with_waveshare_relay` to
+show its current command on a Waveshare Modbus RTU Relay 4CH: passive on CH1,
+charge on CH2, house-only discharge on CH3 and grid export on CH4. This is a
+mode indicator only; the mock remains the source of telemetry and TTL behavior.
 
 The minimum supported Rust version is **1.85**, checked in CI; it is set by
 the serial stack's dependencies, not by this crate's own code.

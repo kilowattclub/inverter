@@ -13,6 +13,11 @@ use crate::{
     Applied, Capabilities, Command, DischargeTarget, Error, Expiry, Inverter, Mode, Telemetry,
 };
 
+#[cfg(feature = "serial")]
+mod relay;
+#[cfg(feature = "serial")]
+pub use relay::RelayMockInverter;
+
 const MODES: &[Mode] = &[Mode::Passive, Mode::ForceCharge, Mode::ForceDischarge];
 
 /// A simulated battery and inverter.
