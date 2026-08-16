@@ -181,16 +181,24 @@ closing the inverter rather than waiting for the hardware timeout.
 | Driver | Reads | Writes | Notes |
 |---|---|---|---|
 | `mock` | ✅ | ✅ | Full simulation with a real one-shot timeout; builders for capacity, SoC, load, solar |
-| `foxess` | ⚠️ unverified | ❌ | H1 G1 (`registers::H1_G1`) and G2 (`registers::H1_G2`) over RS485 |
+| `foxess` | ⚠️ community map | ✅ native timeout | H1 G1 (`registers::H1_G1`) and G2 (`registers::H1_G2`) over RS485 |
 
-**FoxESS writes are deliberately not implemented.** The register maps come
-from community documentation and have not been checked against hardware;
-reads are exposed so the maps *can* be checked. The H1's remote-control
-watchdog — recorded as data in `foxess::registers::remote_control` — is what
-will let a verified write path report `Expiry::InverterTimeout`. Verified
-maps are very welcome: run read-only against a real inverter, confirm every
-value against its display across charging/discharging/idle, and say which
-model, firmware and connection route you tested.
+FoxESS commands use its remote-control registers with Modbus function 6. The
+driver first disables the previous remote command, sets work mode to self-use,
+writes the TTL in whole seconds to `44001`, enables remote control through
+`44000`, then writes active power to `44002`. That last write arms the
+inverter's own countdown. Passive writes `0` to `44000` and self-use to `41000`;
+another command starts the same way, so it cancels and replaces the old
+countdown. Supported TTLs are one through 65,535 seconds; fractional TTLs round
+down so the hardware never outlives the requested command.
+
+FoxESS active-power control can force charge or deliberate grid export, but it
+cannot guarantee house-only discharge as load changes. The driver therefore
+refuses `discharge()` and accepts `export()` when export is intended. The maps
+come from the community-tested `foxess_modbus` integration and remain sensitive
+to model, firmware and connection route. This crate covers the H1-family RS485
+map directly or through an RS485-to-TCP bridge, not the inverter's reduced
+built-in LAN map. Confirm the addresses against your exact hardware before use.
 
 New drivers implement the `Inverter` trait over any `modbus::ModbusBus`,
 with addresses kept as data via `register::RegisterDef` — see the

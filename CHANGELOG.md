@@ -19,6 +19,12 @@ and this project adheres to
   guarantees must refuse the override without changing inverter state.
 - Process lifecycle cleanup remains the application's responsibility; the
   inverter-side timeout is the fail-safe that survives controller failure.
+- The FoxESS H1 driver now applies charge and grid-export commands through the
+  inverter's remote-control block. It disables any old command, programs
+  self-use as the fallback, writes the command TTL to register 44001, and
+  arms the native countdown by writing active power to 44002. Passive disables
+  remote control, and house-only discharge is refused because this register
+  cannot guarantee that energy will not cross the meter.
 
 ### Fixed
 
