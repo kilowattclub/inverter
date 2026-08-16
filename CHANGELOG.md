@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-16
+
+### Changed
+
+- Non-passive command constructors and `InverterExt` methods now require an
+  explicit `Duration` TTL; the implicit five-minute default and
+  `holding_for` override were removed.
+- Writable drivers must arm a one-shot timeout in the inverter for every
+  non-passive command, replace the previous timeout when applying a new
+  command, and cancel it on passive. Drivers that cannot provide those
+  guarantees must refuse the override without changing inverter state.
+- Process lifecycle cleanup remains the application's responsibility; the
+  inverter-side timeout is the fail-safe that survives controller failure.
+
+### Fixed
+
+- A zero-length inverter timeout is no longer considered dead-controller-safe.
+
 ## [0.2.0] - 2026-08-02
 
 ### Changed

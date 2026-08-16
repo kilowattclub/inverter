@@ -385,10 +385,11 @@ mod tests {
     #[test]
     fn refuses_every_command_while_the_map_is_unverified() {
         let mut inv = FoxEss::new(g2_fixture(), &registers::H1_G2);
+        let ttl = std::time::Duration::from_secs(60);
         for command in [
             Command::passive(),
-            Command::charge(2_000.0),
-            Command::export(3_000.0),
+            Command::charge(2.0, ttl),
+            Command::export(3.0, ttl),
         ] {
             assert!(matches!(inv.apply(command), Err(Error::Unsupported(_)),));
         }

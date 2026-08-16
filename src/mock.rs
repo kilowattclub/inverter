@@ -19,7 +19,7 @@ const MODES: &[Mode] = &[Mode::Passive, Mode::ForceCharge, Mode::ForceDischarge]
 ///
 /// The simulation runs on one clock: real time flows into it on every
 /// interaction, and [`MockInverter::advance`] adds simulated time on top.
-/// A command's hold elapses on that same clock, so a test can watch the
+/// A command's TTL elapses on that same clock, so a test can watch the
 /// one-shot timeout revert without sleeping.
 ///
 /// Builder inputs are clamped to physically meaningful values rather than
@@ -101,7 +101,7 @@ impl MockInverter {
 
     /// Advance the simulation by `elapsed` without waiting for real time.
     ///
-    /// The command's hold elapses in simulated time too: advancing past it
+    /// The command's TTL elapses in simulated time too: advancing past it
     /// integrates the battery up to the expiry boundary, reverts to passive,
     /// and runs the remainder passively — exactly what the real hardware the
     /// mock stands in for would have done. Tests should drive the model with
@@ -115,7 +115,7 @@ impl MockInverter {
     #[must_use]
     pub fn active_command(&self) -> Command {
         let since = self.since_command + self.last_sync.elapsed();
-        if self.command.mode != Mode::Passive && since >= self.command.hold {
+        if self.command.ttl().is_some_and(|ttl| since >= ttl) {
             Command::passive()
         } else {
             self.command
@@ -143,12 +143,12 @@ impl MockInverter {
     }
 
     /// Run `elapsed` of simulated time, honouring the one-shot timeout: if
-    /// the hold runs out mid-step, integration splits at that boundary and
+    /// the TTL runs out mid-step, integration splits at that boundary and
     /// the rest of the step runs passive.
     fn step(&mut self, elapsed: Duration) {
         let mut remaining = elapsed;
-        if self.command.mode != Mode::Passive {
-            let until_expiry = self.command.hold.saturating_sub(self.since_command);
+        if let Some(ttl) = self.command.ttl() {
+            let until_expiry = ttl.saturating_sub(self.since_command);
             if remaining >= until_expiry {
                 self.integrate(until_expiry);
                 remaining -= until_expiry;
@@ -171,8 +171,10 @@ impl MockInverter {
 
 impl Inverter for MockInverter {
     fn capabilities(&self) -> Capabilities {
+        // The mock accepts any Duration; Applied reports the exact timeout
+        // armed for an individual command.
         let mut caps =
-            Capabilities::writable("mock", MODES, Expiry::InverterTimeout(self.command.hold));
+            Capabilities::writable("mock", MODES, Expiry::InverterTimeout(Duration::MAX));
         caps.reports_solar = true;
         caps.reports_mode = true;
         caps
@@ -218,12 +220,19 @@ impl Inverter for MockInverter {
                 command.power_kw
             )));
         }
+        if command.mode != Mode::Passive && command.ttl().is_some_and(|ttl| ttl.is_zero()) {
+            return Err(Error::Range(
+                "non-passive command TTL must be greater than zero".into(),
+            ));
+        }
         self.sync();
 
         self.command = command;
         self.since_command = Duration::ZERO;
         Ok(Applied {
-            expiry: Expiry::InverterTimeout(command.hold),
+            expiry: command
+                .ttl()
+                .map_or(Expiry::UntilChanged, Expiry::InverterTimeout),
             power_kw: command.power_kw.min(self.max_power_kw),
         })
     }
@@ -244,10 +253,11 @@ mod tests {
     fn ext_methods_are_partial_applications_of_apply() {
         let mut sugared = MockInverter::new();
         let mut explicit = MockInverter::new();
+        let ttl = Duration::from_secs(60);
         for (via_ext, command) in [
-            (sugared.charge(2), Command::charge(2)),
-            (sugared.discharge(1.5), Command::discharge(1.5)),
-            (sugared.export(3), Command::export(3)),
+            (sugared.charge(2, ttl), Command::charge(2, ttl)),
+            (sugared.discharge(1.5, ttl), Command::discharge(1.5, ttl)),
+            (sugared.export(3, ttl), Command::export(3, ttl)),
             (sugared.passive(), Command::passive()),
         ] {
             let via_ext = via_ext.unwrap();
@@ -276,7 +286,7 @@ mod tests {
     fn mode_reports_the_live_state_including_the_timeout_revert() {
         let mut inv = MockInverter::new();
         assert_eq!(inv.mode().unwrap(), Mode::Passive);
-        inv.apply(Command::charge(1).holding_for(Duration::from_millis(1)))
+        inv.apply(Command::charge(1, Duration::from_millis(1)))
             .unwrap();
         assert_eq!(inv.mode().unwrap(), Mode::ForceCharge);
         std::thread::sleep(Duration::from_millis(5));
@@ -290,7 +300,9 @@ mod tests {
     #[test]
     fn applied_power_is_clamped_to_the_inverter_limit() {
         let mut inv = MockInverter::new().with_max_power_kw(5);
-        let applied = inv.apply(Command::charge(50)).unwrap();
+        let applied = inv
+            .apply(Command::charge(50, Duration::from_secs(60)))
+            .unwrap();
         assert_eq!(applied.power_kw, 5.0, "the clamp must be reported back");
     }
 
@@ -306,7 +318,7 @@ mod tests {
     #[test]
     fn charging_raises_the_state_of_charge() {
         let mut inv = MockInverter::new().with_soc_pct(50.0);
-        inv.apply(Command::charge(1).holding_for(Duration::from_secs(3600)))
+        inv.apply(Command::charge(1, Duration::from_secs(3600)))
             .unwrap();
         inv.advance(Duration::from_secs(3600));
         // 1 kWh into a 10 kWh battery is ten percentage points.
@@ -314,9 +326,9 @@ mod tests {
     }
 
     #[test]
-    fn a_command_reverts_to_passive_once_its_hold_elapses() {
+    fn a_command_reverts_to_passive_once_its_ttl_elapses() {
         let mut inv = MockInverter::new();
-        inv.apply(Command::charge(1).holding_for(Duration::from_secs(60)))
+        inv.apply(Command::charge(1, Duration::from_secs(60)))
             .unwrap();
         assert_eq!(inv.active_command().mode, Mode::ForceCharge);
         inv.advance(Duration::from_secs(61));
@@ -328,15 +340,30 @@ mod tests {
     }
 
     #[test]
-    fn the_hold_expires_in_simulated_time_and_charging_stops_at_the_boundary() {
+    fn a_new_command_replaces_the_previous_ttl() {
+        let mut inv = MockInverter::new();
+        inv.apply(Command::charge(1, Duration::from_secs(5)))
+            .unwrap();
+        inv.apply(Command::discharge(0.5, Duration::from_secs(200)))
+            .unwrap();
+        inv.advance(Duration::from_secs(10));
+        assert_eq!(
+            inv.active_command().mode,
+            Mode::ForceDischarge,
+            "the old charge TTL must not expire the newer discharge command"
+        );
+    }
+
+    #[test]
+    fn the_ttl_expires_in_simulated_time_and_charging_stops_at_the_boundary() {
         let mut inv = MockInverter::new()
             .with_soc_pct(50)
             .with_load_kw(0)
             .with_solar_kw(0);
-        inv.apply(Command::charge(3.6).holding_for(Duration::from_secs(1800)))
+        inv.apply(Command::charge(3.6, Duration::from_secs(1800)))
             .unwrap();
         inv.advance(Duration::from_secs(3600));
-        // 3.6 kW for the 30-minute hold is 1.8 kWh (18 points); the second
+        // 3.6 kW for the 30-minute TTL is 1.8 kWh (18 points); the second
         // half hour must run passive, with nothing flowing.
         assert!((inv.soc_pct - 68.0).abs() < 0.1, "soc was {}", inv.soc_pct);
         assert_eq!(inv.active_command().mode, Mode::Passive);
@@ -345,7 +372,7 @@ mod tests {
     #[test]
     fn active_command_reports_an_elapsed_timeout_without_a_prior_read() {
         let mut inv = MockInverter::new();
-        inv.apply(Command::charge(1).holding_for(Duration::from_millis(1)))
+        inv.apply(Command::charge(1, Duration::from_millis(1)))
             .unwrap();
         std::thread::sleep(Duration::from_millis(5));
         // No advance() or read in between: the answer must still be honest.
@@ -354,14 +381,14 @@ mod tests {
 
     #[test]
     fn state_of_charge_is_clamped_at_both_ends() {
-        let hold = Duration::from_secs(4 * 3600);
+        let ttl = Duration::from_secs(4 * 3600);
         let mut inv = MockInverter::new().with_soc_pct(99.0);
-        inv.apply(Command::charge(5).holding_for(hold)).unwrap();
+        inv.apply(Command::charge(5, ttl)).unwrap();
         inv.advance(Duration::from_secs(4 * 3600));
         assert!(inv.soc_pct <= 100.0);
 
         let mut inv = MockInverter::new().with_soc_pct(1.0);
-        inv.apply(Command::discharge(5).holding_for(hold)).unwrap();
+        inv.apply(Command::discharge(5, ttl)).unwrap();
         inv.advance(Duration::from_secs(4 * 3600));
         assert!(inv.soc_pct >= 0.0);
     }
@@ -374,7 +401,8 @@ mod tests {
             .with_capacity_kwh(0)
             .with_max_power_kw(-5)
             .with_soc_pct(f64::NAN);
-        inv.apply(Command::charge(1)).unwrap();
+        inv.apply(Command::charge(1, Duration::from_secs(60)))
+            .unwrap();
         inv.advance(Duration::from_secs(60));
         let t = inv.read_telemetry().unwrap();
         assert!(t.soc_pct.is_finite(), "soc was {}", t.soc_pct);
@@ -383,7 +411,8 @@ mod tests {
     #[test]
     fn house_only_discharge_does_not_export() {
         let mut inv = MockInverter::new().with_load_kw(0.2);
-        inv.apply(Command::discharge(3)).unwrap();
+        inv.apply(Command::discharge(3, Duration::from_secs(60)))
+            .unwrap();
         let t = inv.read_telemetry().unwrap();
         assert_eq!(t.export_kw(), 0.0, "house-only discharge must not export");
     }
@@ -391,7 +420,8 @@ mod tests {
     #[test]
     fn a_grid_export_command_does_export() {
         let mut inv = MockInverter::new().with_load_kw(0.2);
-        inv.apply(Command::export(3)).unwrap();
+        inv.apply(Command::export(3, Duration::from_secs(60)))
+            .unwrap();
         let t = inv.read_telemetry().unwrap();
         assert!(t.export_kw() > 0.0, "export command must reach the grid");
     }
@@ -399,8 +429,13 @@ mod tests {
     #[test]
     fn rejects_a_nonsensical_power_value() {
         let mut inv = MockInverter::new();
-        assert!(inv.apply(Command::charge(f64::NAN)).is_err());
-        assert!(inv.apply(Command::charge(-1.0)).is_err());
+        assert!(inv
+            .apply(Command::charge(f64::NAN, Duration::from_secs(60)))
+            .is_err());
+        assert!(inv
+            .apply(Command::charge(-1.0, Duration::from_secs(60)))
+            .is_err());
+        assert!(inv.apply(Command::charge(1, Duration::ZERO)).is_err());
     }
 
     #[test]

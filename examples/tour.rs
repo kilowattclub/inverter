@@ -33,22 +33,22 @@ fn main() -> Result<(), inverter::Error> {
     // Charge at 2 kW. What the inverter committed to comes back: the power
     // (possibly clamped) and — the crate's reason to exist — how the
     // command will end.
-    let applied = inverter.charge(2)?;
+    let applied = inverter.charge(2, Duration::from_secs(300))?;
     println!(
         "charging: {} kW, ends by {:?}",
         applied.power_kw, applied.expiry
     );
     assert!(applied.expiry.is_dead_controller_safe());
 
-    // Six simulated minutes later the five-minute hold has lapsed and the
+    // Six simulated minutes later the five-minute TTL has lapsed and the
     // inverter has reverted by itself — no controller involved. That is
     // what a real fail-safe looks like.
     inverter.advance(Duration::from_secs(360));
     println!("later:    mode is {} again", inverter.get_mode()?);
 
     // Commands are also plain data, for planners and safety layers; build
-    // one explicitly to ask for a non-default hold.
-    let command = Command::charge(1.5).holding_for(Duration::from_secs(3600));
+    // one explicitly with its required TTL.
+    let command = Command::charge(1.5, Duration::from_secs(3600));
     println!("planned:  {command}");
     inverter.apply(command)?;
 
