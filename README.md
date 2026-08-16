@@ -33,6 +33,7 @@ let mode = inverter.get_mode()?;      // the Mode currently in force
 
 // 3. Every override has an explicit TTL. Powers are kilowatts:
 let ttl = Duration::from_secs(60);
+inverter.hold(ttl)?;             // reserve the battery at zero power
 inverter.charge(2, ttl)?;        // charge at 2 kW, importing if needed
 inverter.discharge(1.5, ttl)?;   // cover household load only; no export
 inverter.export(3, ttl)?;        // deliberately export to the grid
@@ -59,13 +60,14 @@ Runnable walkthrough: `cargo run --example tour`.
 | Command | The inverter... |
 |---|---|
 | `passive()` | runs its **own self-use logic**, exactly as if no controller were attached: solar powers the house, surplus charges the battery then exports, and after dark the battery covers the house down to its minimum SoC. Vendors call this "self-use" or "self-consumption". |
+| `hold(ttl)` | **keeps battery power at zero**, reserving stored energy while the grid or solar serves the house. |
 | `charge(kw, ttl)` | **forces energy into the battery** at `kw`, importing from the grid when solar can't cover it — how a controller buys a cheap tariff window. |
 | `discharge(kw, ttl)` | **forces energy out of the battery** at `kw`, but only to cover the household load — nothing is pushed past the meter. |
 | `export(kw, ttl)` | **forces energy out of the battery and past the meter** at `kw`, deliberately exporting — for things like grid-services events. |
 
 Passive is the safe floor: it has no power level and nothing to expire, so
 it is always safe to command, and it is what a dead controller's hardware
-should decay to. The three overrides are the commands that need the expiry
+should decay to. The four overrides are the commands that need the expiry
 semantics below.
 
 ## How a command ends
@@ -191,6 +193,9 @@ inverter's own countdown. Passive writes `0` to `44000` and self-use to `41000`;
 another command starts the same way, so it cancels and replaces the old
 countdown. Supported TTLs are one through 65,535 seconds; fractional TTLs round
 down so the hardware never outlives the requested command.
+
+`hold()` writes zero active power behind that same watchdog. On expiry the
+inverter returns to passive self-use.
 
 FoxESS active-power control can force charge or deliberate grid export, but it
 cannot guarantee house-only discharge as load changes. The driver therefore

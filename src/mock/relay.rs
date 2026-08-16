@@ -122,8 +122,9 @@ impl WaveshareRelay {
 /// Modbus RTU Relay 4CH.
 ///
 /// Channel 1 is passive, channel 2 force charge, channel 3 house-only
-/// discharge, and channel 4 grid export. The relay is an indicator only: all
-/// battery telemetry and command-expiry behavior still come from the mock.
+/// discharge, and channel 4 grid export. All channels off means hold. The
+/// relay is an indicator only: all battery telemetry and command-expiry
+/// behavior still come from the mock.
 pub struct RelayMockInverter {
     mock: MockInverter,
     relay: WaveshareRelay,
@@ -209,6 +210,7 @@ impl Inverter for RelayMockInverter {
 fn mask_for(command: Command) -> u8 {
     match (command.mode, command.target) {
         (Mode::Passive, _) => PASSIVE_MASK,
+        (Mode::Hold, _) => 0,
         (Mode::ForceCharge, _) => CHARGE_MASK,
         (Mode::ForceDischarge, DischargeTarget::HouseOnly) => DISCHARGE_MASK,
         (Mode::ForceDischarge, DischargeTarget::GridExport) => EXPORT_MASK,
@@ -314,6 +316,7 @@ mod tests {
         let (mut mock, mask) = indicated_mock();
         for (command, expected) in [
             (Command::passive(), PASSIVE_MASK),
+            (Command::hold(ttl), 0),
             (Command::charge(2, ttl), CHARGE_MASK),
             (Command::discharge(2, ttl), DISCHARGE_MASK),
             (Command::export(2, ttl), EXPORT_MASK),

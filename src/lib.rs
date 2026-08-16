@@ -99,7 +99,7 @@ pub enum Error {
 
 /// What the inverter should be doing.
 ///
-/// [`Passive`](Mode::Passive) is the inverter's own behaviour; the other two
+/// [`Passive`](Mode::Passive) is the inverter's own behaviour; the other three
 /// override it. The overrides are what need [`Expiry`] semantics — passive
 /// has no power level and nothing to expire, which is what makes it the safe
 /// fallback.
@@ -119,6 +119,12 @@ pub enum Mode {
     /// the state a caller should fall back to when unsure, and the state a
     /// dead controller's hardware should decay to.
     Passive,
+    /// Keep battery power at zero: the house and battery neither charge nor
+    /// discharge one another until the command expires.
+    ///
+    /// Unlike [`Passive`](Mode::Passive), this reserves stored energy instead
+    /// of letting the inverter's self-use logic spend it on the house.
+    Hold,
     /// Force energy into the battery now, importing from the grid when solar
     /// cannot cover the requested power.
     ///
@@ -141,6 +147,7 @@ impl Mode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Mode::Passive => "passive",
+            Mode::Hold => "hold",
             Mode::ForceCharge => "force_charge",
             Mode::ForceDischarge => "force_discharge",
         }
@@ -155,7 +162,9 @@ impl std::fmt::Display for Mode {
 
 /// The error from parsing a string that names no [`Mode`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error(r#"unrecognised mode {0:?}: expected "passive", "force_charge" or "force_discharge""#)]
+#[error(
+    r#"unrecognised mode {0:?}: expected "passive", "hold", "force_charge" or "force_discharge""#
+)]
 pub struct ParseModeError(String);
 
 impl std::str::FromStr for Mode {
@@ -165,6 +174,7 @@ impl std::str::FromStr for Mode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "passive" => Ok(Mode::Passive),
+            "hold" => Ok(Mode::Hold),
             "force_charge" => Ok(Mode::ForceCharge),
             "force_discharge" => Ok(Mode::ForceDischarge),
             _ => Err(ParseModeError(s.to_string())),
@@ -190,7 +200,8 @@ pub enum DischargeTarget {
 pub struct Command {
     /// What the inverter should do.
     pub mode: Mode,
-    /// Requested power in kilowatts. Ignored for [`Mode::Passive`].
+    /// Requested power in kilowatts. Ignored for [`Mode::Passive`] and
+    /// [`Mode::Hold`].
     pub power_kw: f64,
     /// Where discharged energy should go. Ignored unless discharging.
     pub target: DischargeTarget,
@@ -207,6 +218,17 @@ impl Command {
             power_kw: 0.0,
             target: DischargeTarget::HouseOnly,
             ttl: None,
+        }
+    }
+
+    /// Keep battery power at zero for at most `ttl`, then return to passive.
+    #[must_use]
+    pub fn hold(ttl: Duration) -> Self {
+        Command {
+            mode: Mode::Hold,
+            power_kw: 0.0,
+            target: DischargeTarget::HouseOnly,
+            ttl: Some(ttl),
         }
     }
 
@@ -258,6 +280,7 @@ impl std::fmt::Display for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match (self.mode, self.target) {
             (Mode::Passive, _) => f.write_str("passive"),
+            (Mode::Hold, _) => f.write_str("hold"),
             (Mode::ForceDischarge, DischargeTarget::GridExport) => {
                 write!(f, "force_discharge@{}kW(grid-export)", self.power_kw)
             }
@@ -517,6 +540,11 @@ pub trait InverterExt: Inverter {
         self.apply(Command::passive())
     }
 
+    /// Keep battery power at zero for at most `ttl`, then return to passive.
+    fn hold(&mut self, ttl: Duration) -> Result<Applied, Error> {
+        self.apply(Command::hold(ttl))
+    }
+
     /// Charge at `power_kw`, importing if necessary, for at most `ttl`.
     fn charge(&mut self, power_kw: impl Into<f64>, ttl: Duration) -> Result<Applied, Error> {
         self.apply(Command::charge(power_kw, ttl))
@@ -583,7 +611,12 @@ mod tests {
 
     #[test]
     fn mode_round_trips_through_its_identifier() {
-        for mode in [Mode::Passive, Mode::ForceCharge, Mode::ForceDischarge] {
+        for mode in [
+            Mode::Passive,
+            Mode::Hold,
+            Mode::ForceCharge,
+            Mode::ForceDischarge,
+        ] {
             assert_eq!(mode.as_str().parse(), Ok(mode));
             assert_eq!(mode.to_string(), mode.as_str(), "Display matches as_str");
         }
@@ -615,6 +648,7 @@ mod tests {
     fn display_names_the_mode_power_and_export_intent() {
         let ttl = Duration::from_secs(60);
         assert_eq!(Command::passive().to_string(), "passive");
+        assert_eq!(Command::hold(ttl).to_string(), "hold");
         assert_eq!(Command::charge(2, ttl).to_string(), "force_charge@2kW");
         assert_eq!(
             Command::discharge(1.5, ttl).to_string(),
@@ -629,6 +663,7 @@ mod tests {
     #[test]
     fn non_passive_commands_have_explicit_ttls_but_passive_does_not() {
         let ttl = Duration::from_secs(60);
+        assert_eq!(Command::hold(ttl).ttl(), Some(ttl));
         assert_eq!(Command::charge(1.0, ttl).ttl(), Some(ttl));
         assert_eq!(Command::discharge(1.0, ttl).ttl(), Some(ttl));
         assert_eq!(Command::export(1.0, ttl).ttl(), Some(ttl));

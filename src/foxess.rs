@@ -33,7 +33,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 const LOG_TARGET: &str = "inverter.foxess";
 
-const MODES: &[Mode] = &[Mode::Passive, Mode::ForceCharge, Mode::ForceDischarge];
+const MODES: &[Mode] = &[
+    Mode::Passive,
+    Mode::Hold,
+    Mode::ForceCharge,
+    Mode::ForceDischarge,
+];
 const MAX_TIMEOUT: Duration = Duration::from_secs(u16::MAX as u64);
 
 /// The registers a FoxESS telemetry read needs, for one model generation.
@@ -191,6 +196,7 @@ impl<B: ModbusBus> FoxEss<B> {
         }
 
         let remote_power_kw = match (command.mode, command.target) {
+            (Mode::Hold, _) => 0.0,
             (Mode::ForceCharge, _) => -command.power_kw,
             (Mode::ForceDischarge, DischargeTarget::GridExport) => command.power_kw,
             (Mode::ForceDischarge, DischargeTarget::HouseOnly) => {
@@ -204,7 +210,7 @@ impl<B: ModbusBus> FoxEss<B> {
                 return Err(Error::Range("passive has no command values".into()));
             }
         };
-        if command.power_kw <= 0.0 {
+        if command.mode != Mode::Hold && command.power_kw <= 0.0 {
             return Err(Error::Range(format!(
                 "command power must be positive, got {} kW",
                 command.power_kw
@@ -513,6 +519,27 @@ mod tests {
                 (registers::remote_control::TIMEOUT_SET.address, 15),
                 (registers::remote_control::REMOTE_ENABLE.address, 1),
                 (registers::remote_control::ACTIVE_POWER.address, 3000),
+            ]
+        );
+    }
+
+    #[test]
+    fn hold_uses_zero_active_power_with_the_native_watchdog() {
+        let mut inv = FoxEss::new(g2_fixture(), &registers::H1_G2);
+        let ttl = Duration::from_secs(90);
+
+        let applied = inv.apply(Command::hold(ttl)).unwrap();
+
+        assert_eq!(applied.expiry, Expiry::InverterTimeout(ttl));
+        assert_eq!(applied.power_kw, 0.0);
+        assert_eq!(
+            inv.bus.writes,
+            [
+                (registers::remote_control::REMOTE_ENABLE.address, 0),
+                (registers::remote_control::WORK_MODE.address, 0),
+                (registers::remote_control::TIMEOUT_SET.address, 90),
+                (registers::remote_control::REMOTE_ENABLE.address, 1),
+                (registers::remote_control::ACTIVE_POWER.address, 0),
             ]
         );
     }

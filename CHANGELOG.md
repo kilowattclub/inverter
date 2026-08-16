@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-17
+
+### Added
+
+- `Mode::Hold`, `Command::hold` and `InverterExt::hold` keep battery power at
+  zero behind the inverter's native one-shot watchdog. FoxESS implements hold
+  as zero remote active power; the relay mock displays it with all channels
+  off.
+
+### Fixed
+
+- The mock no longer reports battery power that cannot physically flow: an
+  empty battery cannot discharge, a full battery cannot charge, and a
+  house-only discharge is capped at the household's net demand.
+
 ## [0.3.1] - 2026-08-17
 
 ### Added

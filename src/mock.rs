@@ -18,7 +18,12 @@ mod relay;
 #[cfg(feature = "serial")]
 pub use relay::RelayMockInverter;
 
-const MODES: &[Mode] = &[Mode::Passive, Mode::ForceCharge, Mode::ForceDischarge];
+const MODES: &[Mode] = &[
+    Mode::Passive,
+    Mode::Hold,
+    Mode::ForceCharge,
+    Mode::ForceDischarge,
+];
 
 /// A simulated battery and inverter.
 ///
@@ -136,14 +141,27 @@ impl MockInverter {
 
     fn battery_flow_kw(&self) -> f64 {
         let requested = self.command.power_kw.abs().min(self.max_power_kw);
-        match self.command.mode {
+        let flow = match self.command.mode {
             Mode::Passive => {
                 // Self-use: soak surplus PV, otherwise cover the load.
                 let surplus = self.solar_kw - self.baseline_load_kw;
                 surplus.clamp(-self.max_power_kw, self.max_power_kw)
             }
+            Mode::Hold => 0.0,
             Mode::ForceCharge => requested,
-            Mode::ForceDischarge => -requested,
+            Mode::ForceDischarge => {
+                let discharge = if self.command.target == DischargeTarget::HouseOnly {
+                    requested.min((self.baseline_load_kw - self.solar_kw).max(0.0))
+                } else {
+                    requested
+                };
+                -discharge
+            }
+        };
+        if (flow > 0.0 && self.soc_pct >= 100.0) || (flow < 0.0 && self.soc_pct <= 0.0) {
+            0.0
+        } else {
+            flow
         }
     }
 
@@ -260,6 +278,7 @@ mod tests {
         let mut explicit = MockInverter::new();
         let ttl = Duration::from_secs(60);
         for (via_ext, command) in [
+            (sugared.hold(ttl), Command::hold(ttl)),
             (sugared.charge(2, ttl), Command::charge(2, ttl)),
             (sugared.discharge(1.5, ttl), Command::discharge(1.5, ttl)),
             (sugared.export(3, ttl), Command::export(3, ttl)),
@@ -420,6 +439,42 @@ mod tests {
             .unwrap();
         let t = inv.read_telemetry().unwrap();
         assert_eq!(t.export_kw(), 0.0, "house-only discharge must not export");
+        assert!((t.battery_kw + 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_empty_battery_cannot_power_the_house() {
+        let mut inv = MockInverter::new().with_soc_pct(0).with_load_kw(1.5);
+        let passive = inv.read_telemetry().unwrap();
+        assert_eq!(passive.battery_kw, 0.0);
+        assert_eq!(passive.grid_kw, 1.5);
+
+        inv.apply(Command::discharge(3, Duration::from_secs(60)))
+            .unwrap();
+        let forced = inv.read_telemetry().unwrap();
+        assert_eq!(forced.battery_kw, 0.0);
+        assert_eq!(forced.grid_kw, 1.5);
+    }
+
+    #[test]
+    fn a_full_battery_cannot_accept_more_energy() {
+        let mut inv = MockInverter::new().with_soc_pct(100).with_load_kw(0.4);
+        inv.apply(Command::charge(3, Duration::from_secs(60)))
+            .unwrap();
+        let telemetry = inv.read_telemetry().unwrap();
+        assert_eq!(telemetry.battery_kw, 0.0);
+        assert_eq!(telemetry.grid_kw, 0.4);
+    }
+
+    #[test]
+    fn hold_keeps_battery_power_at_zero_until_it_expires() {
+        let mut inv = MockInverter::new().with_soc_pct(50).with_load_kw(1.5);
+        inv.apply(Command::hold(Duration::from_secs(60))).unwrap();
+        let telemetry = inv.read_telemetry().unwrap();
+        assert_eq!(telemetry.battery_kw, 0.0);
+        assert_eq!(telemetry.grid_kw, 1.5);
+        inv.advance(Duration::from_secs(60));
+        assert_eq!(inv.active_command().mode, Mode::Passive);
     }
 
     #[test]
