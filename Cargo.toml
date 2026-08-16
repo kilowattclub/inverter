@@ -1,6 +1,6 @@
 [package]
 name = "inverter"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # MSRV is capped by serialport's dependency tree (edition 2024); the crate's
 # own code needs much less. Checked by the `msrv` CI job — bump consciously.

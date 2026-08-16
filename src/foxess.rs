@@ -1,12 +1,11 @@
 //! FoxESS H1-series driver.
 //!
-//! **Reads only.** The register maps here are compiled from community
-//! documentation — principally the
+//! The register maps here are compiled from community documentation — principally the
 //! [`nathanmarlor/foxess_modbus`](https://github.com/nathanmarlor/foxess_modbus)
-//! Home Assistant integration (MIT) — and have not been verified against
-//! hardware, so this driver reports [`Capabilities::can_write`] as `false` and
-//! refuses commands. Verify a map against the inverter's own display before
-//! that changes — see the crate README for what verification means.
+//! Home Assistant integration (MIT). Telemetry and the H1 remote-control block
+//! have been exercised by that project across H1-family hardware, but remain
+//! model- and firmware-sensitive; see the crate README before enabling a real
+//! installation.
 //!
 //! # Which map?
 //!
@@ -16,25 +15,26 @@
 //! or [`registers::H1_G2`] to match the unit. An H1 connected through its own
 //! LAN module speaks a third, reduced map that this driver does not cover.
 //!
-//! # The write path that is not implemented yet
+//! # Native command timeout
 //!
 //! The H1's remote-control block (see [`registers::remote_control`]) carries
 //! a genuine watchdog: a timeout register the inverter counts down on its own
-//! and, on expiry, reverts to its programmed work mode. A verified write path
-//! can therefore offer [`Expiry::InverterTimeout`](crate::Expiry::InverterTimeout)
-//! — a dead controller leaves the inverter reverting by itself. That answer
-//! comes from reading `foxess_modbus`; it still needs proving on hardware
-//! before writes open.
+//! and, on expiry, reverts to its programmed work mode. This driver programs
+//! self-use as that fallback, replaces the timeout before every command, and
+//! disables remote control for passive. The countdown lives in the inverter,
+//! so a dead controller still leaves the command expiring by itself.
 
 use crate::modbus::{read_words, with_retries, ModbusBus};
-use crate::register::{decode, RegisterDef};
-use crate::{Applied, Capabilities, Command, Error, Inverter, Mode, Telemetry};
-use std::time::{Instant, SystemTime};
+use crate::register::{decode, encode, RegisterDef};
+use crate::{
+    Applied, Capabilities, Command, DischargeTarget, Error, Expiry, Inverter, Mode, Telemetry,
+};
+use std::time::{Duration, Instant, SystemTime};
 
 const LOG_TARGET: &str = "inverter.foxess";
 
-const WRITE_BLOCKED: &str = "FoxESS register map is unverified on hardware; \
-     reads are trusted, writes are not implemented";
+const MODES: &[Mode] = &[Mode::Passive, Mode::ForceCharge, Mode::ForceDischarge];
+const MAX_TIMEOUT: Duration = Duration::from_secs(u16::MAX as u64);
 
 /// The registers a FoxESS telemetry read needs, for one model generation.
 ///
@@ -99,11 +99,10 @@ pub mod registers {
         ],
     };
 
-    /// The H1 family's remote-control block: the future write path.
+    /// The H1 family's remote-control block.
     ///
-    /// Not used by the driver yet — recorded so verification against hardware
-    /// can start from data, not from a Home Assistant code dive. Semantics
-    /// observed in `foxess_modbus`'s `remote_control_manager.py`:
+    /// Semantics observed in `foxess_modbus`'s
+    /// `remote_control_manager.py` and its hardware reports:
     ///
     /// * Enabling: write [`remote_control::TIMEOUT_SET`], then `1` to
     ///   [`remote_control::REMOTE_ENABLE`]. These registers reject
@@ -111,14 +110,12 @@ pub mod registers {
     /// * While enabled, [`remote_control::ACTIVE_POWER`] sets inverter power:
     ///   positive exports/discharges, negative imports/charges (opposite sign
     ///   to [`crate::Telemetry::battery_kw`] — a write path must negate).
-    /// * [`remote_control::TIMEOUT_SET`] is a watchdog reload in seconds. If
-    ///   the controller stops writing, the inverter reverts *by itself* to
-    ///   the work mode in [`remote_control::WORK_MODE`] — `foxess_modbus`
-    ///   re-writes power every poll and sets the timeout to twice its poll
-    ///   rate. This is what makes [`crate::Expiry::InverterTimeout`] honest
-    ///   for this hardware, and it also means the fallback must be programmed
-    ///   to self-use *before* enabling remote control if expiry is to mean
-    ///   "passive".
+    /// * [`remote_control::TIMEOUT_SET`] sets the watchdog period in seconds;
+    ///   writing [`remote_control::ACTIVE_POWER`] loads/reloads its countdown.
+    ///   If the controller stops writing, the inverter reverts *by itself* to
+    ///   the work mode in [`remote_control::WORK_MODE`]. This driver sets that
+    ///   fallback to self-use before enabling remote control, so expiry means
+    ///   [`Mode::Passive`](crate::Mode::Passive).
     /// * The inverter does **not** respect [`remote_control::MAX_SOC`] while
     ///   remote-control charging (`foxess_modbus` enforces it in software);
     ///   it does respect [`remote_control::MIN_SOC`] and the max discharge
@@ -154,11 +151,11 @@ pub struct FoxEss<B: ModbusBus> {
 }
 
 impl<B: ModbusBus> FoxEss<B> {
-    /// Wrap an already-open bus, reading via `map`.
+    /// Wrap an already-open bus, reading and commanding via `map`.
     pub fn new(bus: B, map: &'static RegisterMap) -> Self {
         log::warn!(
             target: LOG_TARGET,
-            "FoxESS driver started with an UNVERIFIED register map ({}) - reads only",
+            "FoxESS driver started with a community register map ({})",
             map.model
         );
         Self { bus, map }
@@ -171,6 +168,80 @@ impl<B: ModbusBus> FoxEss<B> {
             &format!("read {}", reg.name),
             |bus| read_words(bus, reg).map(|words| decode(reg, &words)),
         )
+    }
+
+    fn write(&mut self, reg: &RegisterDef, value: u16) -> Result<(), Error> {
+        with_retries(
+            &mut self.bus,
+            LOG_TARGET,
+            &format!("write {}", reg.name),
+            |bus| bus.write_holding(reg.address, value),
+        )
+    }
+
+    fn command_values(command: Command) -> Result<(u16, u16, f64), Error> {
+        let ttl = command
+            .ttl()
+            .ok_or_else(|| Error::Range(format!("{} requires a non-zero TTL", command.mode)))?;
+        if ttl < Duration::from_secs(1) || ttl > MAX_TIMEOUT {
+            return Err(Error::Range(format!(
+                "FoxESS command TTL must be 1..={} seconds, got {ttl:?}",
+                u16::MAX
+            )));
+        }
+
+        let remote_power_kw = match (command.mode, command.target) {
+            (Mode::ForceCharge, _) => -command.power_kw,
+            (Mode::ForceDischarge, DischargeTarget::GridExport) => command.power_kw,
+            (Mode::ForceDischarge, DischargeTarget::HouseOnly) => {
+                return Err(Error::Unsupported(
+                    "FoxESS active-power control cannot guarantee house-only discharge; \
+                     use export() when grid export is intended"
+                        .into(),
+                ));
+            }
+            (Mode::Passive, _) => {
+                return Err(Error::Range("passive has no command values".into()));
+            }
+        };
+        if command.power_kw <= 0.0 {
+            return Err(Error::Range(format!(
+                "command power must be positive, got {} kW",
+                command.power_kw
+            )));
+        }
+
+        let raw_power = encode(&registers::remote_control::ACTIVE_POWER, remote_power_kw)?;
+        let applied_power_kw = decode(&registers::remote_control::ACTIVE_POWER, &[raw_power]).abs();
+        Ok((ttl.as_secs() as u16, raw_power, applied_power_kw))
+    }
+
+    fn return_to_passive(&mut self) -> Result<(), Error> {
+        use registers::remote_control as remote;
+
+        self.write(&remote::REMOTE_ENABLE, 0)?;
+        self.write(&remote::WORK_MODE, 0)
+    }
+
+    fn program_command(&mut self, timeout: u16, raw_power: u16) -> Result<(), Error> {
+        use registers::remote_control as remote;
+
+        // Cancel the old remote state first. A partially programmed replacement
+        // therefore fails passive instead of leaving the previous power active.
+        self.return_to_passive()?;
+        self.write(&remote::TIMEOUT_SET, timeout)?;
+        self.write(&remote::REMOTE_ENABLE, 1)?;
+        // FoxESS loads/reloads the hardware countdown on this write.
+        self.write(&remote::ACTIVE_POWER, raw_power)
+    }
+
+    fn disable_after_error(&mut self, error: Error) -> Error {
+        match self.return_to_passive() {
+            Ok(()) => error,
+            Err(disable_error) => Error::Comm(format!(
+                "command failed ({error}); also failed to return FoxESS to passive ({disable_error})"
+            )),
+        }
     }
 }
 
@@ -203,10 +274,8 @@ impl FoxEss<crate::modbus::TcpBus> {
 
 impl<B: ModbusBus> Inverter for FoxEss<B> {
     fn capabilities(&self) -> Capabilities {
-        // A verified write path built on the remote-control watchdog would
-        // become writable with InverterTimeout expiry and mode read-back -
-        // see the registers::remote_control docs.
-        let mut caps = Capabilities::read_only(self.map.model, WRITE_BLOCKED);
+        let mut caps =
+            Capabilities::writable(self.map.model, MODES, Expiry::InverterTimeout(MAX_TIMEOUT));
         caps.reports_solar = !self.map.pv_powers.is_empty();
         caps
     }
@@ -235,18 +304,31 @@ impl<B: ModbusBus> Inverter for FoxEss<B> {
     }
 
     fn apply(&mut self, command: Command) -> Result<Applied, Error> {
-        Err(Error::Unsupported(format!(
-            "{WRITE_BLOCKED} (refused: {command})"
-        )))
+        if command.mode == Mode::Passive {
+            self.return_to_passive()?;
+            return Ok(Applied {
+                expiry: Expiry::UntilChanged,
+                power_kw: 0.0,
+            });
+        }
+
+        // Validate every value before touching Modbus. Once programming starts,
+        // any failure is followed by a best-effort return to passive.
+        let (timeout, raw_power, applied_power_kw) = Self::command_values(command)?;
+        if let Err(error) = self.program_command(timeout, raw_power) {
+            return Err(self.disable_after_error(error));
+        }
+        Ok(Applied {
+            expiry: Expiry::InverterTimeout(Duration::from_secs(timeout.into())),
+            power_kw: applied_power_kw,
+        })
     }
 
     fn mode(&mut self) -> Result<Mode, Error> {
-        // The imposed state lives in the unverified remote-control block, and
-        // repeating a guess would hide an expired or app-driven change.
+        // Remote-enable and active-power read-back varies by connection route;
+        // repeating the last command would hide an expiry or app-driven change.
         Err(Error::Unsupported(
-            "FoxESS mode read-back is not implemented: \
-             the remote-control registers are unverified"
-                .into(),
+            "FoxESS mode read-back is not reliable across supported connection routes".into(),
         ))
     }
 }
@@ -256,14 +338,11 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// What a verified write path would eventually expose. Asserted against so
-    /// that enabling writes without updating `capabilities` fails a test.
-    const INTENDED_MODES: &[Mode] = &[Mode::Passive, Mode::ForceCharge, Mode::ForceDischarge];
-
-    /// A bus that replays canned register values.
+    /// A bus that replays reads and records function-6 writes.
     struct FakeBus {
         input: HashMap<u16, Vec<u16>>,
         holding: HashMap<u16, Vec<u16>>,
+        writes: Vec<(u16, u16)>,
     }
 
     impl FakeBus {
@@ -271,6 +350,7 @@ mod tests {
             Self {
                 input: pairs.iter().map(|&(a, v)| (a, vec![v])).collect(),
                 holding: HashMap::new(),
+                writes: Vec::new(),
             }
         }
 
@@ -278,6 +358,7 @@ mod tests {
             Self {
                 input: HashMap::new(),
                 holding: pairs.iter().map(|&(a, v)| (a, vec![v])).collect(),
+                writes: Vec::new(),
             }
         }
     }
@@ -295,8 +376,9 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| Error::Comm(format!("no fixture for holding {address}")))
         }
-        fn write_holding(&mut self, _address: u16, _value: u16) -> Result<(), Error> {
-            Err(Error::Comm("fake bus is read-only".into()))
+        fn write_holding(&mut self, address: u16, value: u16) -> Result<(), Error> {
+            self.writes.push((address, value));
+            Ok(())
         }
     }
 
@@ -362,16 +444,18 @@ mod tests {
     }
 
     #[test]
-    fn reports_that_it_cannot_write_and_says_why() {
+    fn reports_native_timeout_write_capability() {
         for map in [&registers::H1_G1, &registers::H1_G2] {
             let inv = FoxEss::new(FakeBus::with_input(&[]), map);
             let caps = inv.capabilities();
-            assert!(!caps.can_write);
-            assert!(caps.write_blocked_reason.is_some());
+            assert!(caps.can_write);
+            assert_eq!(caps.write_blocked_reason, None);
+            assert_eq!(caps.expiry, Expiry::InverterTimeout(MAX_TIMEOUT));
+            assert!(caps.expiry.is_dead_controller_safe());
             assert!(caps.reports_solar);
-            assert!(!caps.reports_mode, "mode() cannot answer until verified");
-            for mode in INTENDED_MODES {
-                assert!(!caps.supports(*mode), "{mode:?} must not be advertised");
+            assert!(!caps.reports_mode, "mode read-back varies by connection");
+            for mode in MODES {
+                assert!(caps.supports(*mode), "{mode:?} must be advertised");
             }
         }
     }
@@ -383,15 +467,104 @@ mod tests {
     }
 
     #[test]
-    fn refuses_every_command_while_the_map_is_unverified() {
+    fn a_charge_uses_the_native_watchdog_and_foxess_power_sign() {
         let mut inv = FoxEss::new(g2_fixture(), &registers::H1_G2);
-        for command in [
-            Command::passive(),
-            Command::charge(2_000.0),
-            Command::export(3_000.0),
-        ] {
-            assert!(matches!(inv.apply(command), Err(Error::Unsupported(_)),));
+        let ttl = Duration::from_secs(60);
+
+        let applied = inv.apply(Command::charge(2.0, ttl)).unwrap();
+
+        assert_eq!(applied.expiry, Expiry::InverterTimeout(ttl));
+        assert_eq!(applied.power_kw, 2.0);
+        assert_eq!(
+            inv.bus.writes,
+            [
+                (registers::remote_control::REMOTE_ENABLE.address, 0),
+                (registers::remote_control::WORK_MODE.address, 0),
+                (registers::remote_control::TIMEOUT_SET.address, 60),
+                (registers::remote_control::REMOTE_ENABLE.address, 1),
+                (
+                    registers::remote_control::ACTIVE_POWER.address,
+                    (-2000i16) as u16
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_command_cancels_and_replaces_the_native_watchdog() {
+        let mut inv = FoxEss::new(g2_fixture(), &registers::H1_G2);
+        inv.apply(Command::charge(2.0, Duration::from_secs(60)))
+            .unwrap();
+        inv.bus.writes.clear();
+
+        let applied = inv
+            .apply(Command::export(3.0, Duration::from_secs(15)))
+            .unwrap();
+
+        assert_eq!(
+            applied.expiry,
+            Expiry::InverterTimeout(Duration::from_secs(15))
+        );
+        assert_eq!(
+            inv.bus.writes,
+            [
+                (registers::remote_control::REMOTE_ENABLE.address, 0),
+                (registers::remote_control::WORK_MODE.address, 0),
+                (registers::remote_control::TIMEOUT_SET.address, 15),
+                (registers::remote_control::REMOTE_ENABLE.address, 1),
+                (registers::remote_control::ACTIVE_POWER.address, 3000),
+            ]
+        );
+    }
+
+    #[test]
+    fn passive_disables_remote_control_without_arming_another_timeout() {
+        let mut inv = FoxEss::new(g2_fixture(), &registers::H1_G2);
+
+        let applied = inv.apply(Command::passive()).unwrap();
+
+        assert_eq!(applied.expiry, Expiry::UntilChanged);
+        assert_eq!(applied.power_kw, 0.0);
+        assert_eq!(
+            inv.bus.writes,
+            [
+                (registers::remote_control::REMOTE_ENABLE.address, 0),
+                (registers::remote_control::WORK_MODE.address, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_commands_are_rejected_before_modbus_is_touched() {
+        let commands = [
+            Command::charge(2.0, Duration::from_millis(999)),
+            Command::charge(2.0, MAX_TIMEOUT + Duration::from_secs(1)),
+            Command::charge(0.0, Duration::from_secs(60)),
+            Command::discharge(2.0, Duration::from_secs(60)),
+        ];
+
+        for command in commands {
+            let mut inv = FoxEss::new(g2_fixture(), &registers::H1_G2);
+            assert!(inv.apply(command).is_err());
+            assert!(inv.bus.writes.is_empty());
         }
+    }
+
+    #[test]
+    fn fractional_ttls_round_down_so_the_hardware_never_outlives_the_command() {
+        let mut inv = FoxEss::new(g2_fixture(), &registers::H1_G2);
+        let applied = inv
+            .apply(Command::export(1.0, Duration::from_millis(1_999)))
+            .unwrap();
+
+        assert_eq!(
+            applied.expiry,
+            Expiry::InverterTimeout(Duration::from_secs(1))
+        );
+        assert_eq!(
+            inv.bus.writes[2],
+            (registers::remote_control::TIMEOUT_SET.address, 1)
+        );
     }
 
     #[test]
@@ -455,10 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_control_registers_are_recorded_but_unused() {
-        // The write path is not implemented; the block is data for hardware
-        // verification. The watchdog register is the whole point: it is what
-        // will let a verified write path report Expiry::InverterTimeout.
+    fn remote_control_registers_pin_the_h1_function_6_addresses() {
         assert_eq!(registers::remote_control::TIMEOUT_SET.address, 44001);
         assert_eq!(registers::remote_control::REMOTE_ENABLE.address, 44000);
         assert_eq!(registers::remote_control::ACTIVE_POWER.address, 44002);

@@ -27,6 +27,7 @@
 //! # #[cfg(feature = "mock")]
 //! # fn main() -> Result<(), inverter::Error> {
 //! use inverter::{Inverter, InverterExt, Mode, mock::MockInverter};
+//! use std::time::Duration;
 //!
 //! let mut inv = MockInverter::new();
 //! let caps = inv.capabilities();
@@ -40,8 +41,8 @@
 //! assert_eq!(inv.get_mode()?, Mode::Passive);
 //!
 //! if caps.supports(Mode::ForceCharge) {
-//!     // Sugar for inv.apply(Command::charge(2)). Powers are kilowatts.
-//!     let applied = inv.charge(2)?;
+//!     // Every override has an explicit TTL. Powers are kilowatts.
+//!     let applied = inv.charge(2, Duration::from_secs(60))?;
 //!     // How this command ends is data, not an assumption.
 //!     println!("expires: {:?}", applied.expiry);
 //! }
@@ -193,19 +194,11 @@ pub struct Command {
     pub power_kw: f64,
     /// Where discharged energy should go. Ignored unless discharging.
     pub target: DischargeTarget,
-    /// How long the caller wants the command to last.
-    ///
-    /// This is a *request*. What the inverter actually commits to comes back
-    /// in [`Applied::expiry`], and it may be weaker than what you asked for.
-    pub hold: Duration,
+    /// `None` for passive; always `Some` for an override.
+    ttl: Option<Duration>,
 }
 
 impl Command {
-    /// Hold requested by the convenience constructors: long enough to survive
-    /// a missed control tick, short enough that a dead controller stops
-    /// mattering. Override it with [`Command::holding_for`].
-    pub const DEFAULT_HOLD: Duration = Duration::from_secs(300);
-
     /// Return to the inverter's own self-use behaviour ([`Mode::Passive`]).
     #[must_use]
     pub fn passive() -> Self {
@@ -213,48 +206,49 @@ impl Command {
             mode: Mode::Passive,
             power_kw: 0.0,
             target: DischargeTarget::HouseOnly,
-            hold: Self::DEFAULT_HOLD,
+            ttl: None,
         }
     }
 
-    /// Charge at `power_kw`, importing if necessary.
+    /// Charge at `power_kw`, importing if necessary, for at most `ttl`.
     #[must_use]
-    pub fn charge(power_kw: impl Into<f64>) -> Self {
+    pub fn charge(power_kw: impl Into<f64>, ttl: Duration) -> Self {
         Command {
             mode: Mode::ForceCharge,
             power_kw: power_kw.into(),
             target: DischargeTarget::HouseOnly,
-            hold: Self::DEFAULT_HOLD,
+            ttl: Some(ttl),
         }
     }
 
-    /// Discharge at `power_kw` to cover household load, without exporting.
+    /// Discharge at `power_kw` to cover household load for at most `ttl`,
+    /// without exporting.
     #[must_use]
-    pub fn discharge(power_kw: impl Into<f64>) -> Self {
+    pub fn discharge(power_kw: impl Into<f64>, ttl: Duration) -> Self {
         Command {
             mode: Mode::ForceDischarge,
             power_kw: power_kw.into(),
             target: DischargeTarget::HouseOnly,
-            hold: Self::DEFAULT_HOLD,
+            ttl: Some(ttl),
         }
     }
 
-    /// Discharge at `power_kw`, deliberately exporting to the grid.
+    /// Discharge at `power_kw` for at most `ttl`, deliberately exporting to
+    /// the grid.
     #[must_use]
-    pub fn export(power_kw: impl Into<f64>) -> Self {
+    pub fn export(power_kw: impl Into<f64>, ttl: Duration) -> Self {
         Command {
             mode: Mode::ForceDischarge,
             power_kw: power_kw.into(),
             target: DischargeTarget::GridExport,
-            hold: Self::DEFAULT_HOLD,
+            ttl: Some(ttl),
         }
     }
 
-    /// Ask the inverter to hold this command for `hold` rather than the default.
+    /// The override's time to live, or `None` for [`Mode::Passive`].
     #[must_use]
-    pub fn holding_for(mut self, hold: Duration) -> Self {
-        self.hold = hold;
-        self
+    pub fn ttl(&self) -> Option<Duration> {
+        self.ttl
     }
 }
 
@@ -312,7 +306,7 @@ impl Expiry {
     /// to issue non-passive commands when this is `false`.
     #[must_use]
     pub fn is_dead_controller_safe(&self) -> bool {
-        matches!(self, Expiry::InverterTimeout(_))
+        matches!(self, Expiry::InverterTimeout(timeout) if !timeout.is_zero())
     }
 }
 
@@ -339,6 +333,10 @@ pub struct Capabilities {
     /// `can_write` is true.
     pub modes: &'static [Mode],
     /// How commands issued by this driver end.
+    ///
+    /// For [`Expiry::InverterTimeout`], the duration is the largest timeout
+    /// the driver can accept. [`Applied::expiry`] reports the exact timeout
+    /// armed for an individual command.
     pub expiry: Expiry,
     /// Whether the driver can report PV generation.
     pub reports_solar: bool,
@@ -454,9 +452,9 @@ impl Telemetry {
 pub struct Applied {
     /// How this command will actually end.
     ///
-    /// Compare against what the caller needs. A driver is allowed to return a
-    /// weaker guarantee than requested; silently assuming otherwise is the
-    /// mistake this type exists to prevent.
+    /// For a non-passive command this must be a non-zero
+    /// [`Expiry::InverterTimeout`] no longer than [`Command::ttl`]. A driver
+    /// that cannot provide that guarantee must refuse the command.
     pub expiry: Expiry,
     /// Power the driver actually commanded, kilowatts, after any
     /// model-specific clamping.
@@ -480,6 +478,10 @@ pub trait Inverter: Send {
     ///
     /// Returns [`Error::Unsupported`] when [`Capabilities`] says the mode is
     /// unavailable. Implementors should verify writes by reading them back.
+    /// A non-passive command must replace any previous inverter-side watchdog
+    /// with a one-shot timeout no longer than [`Command::ttl`]; passive must
+    /// cancel that watchdog. A driver that cannot do this must refuse the
+    /// non-passive command without changing inverter state.
     fn apply(&mut self, command: Command) -> Result<Applied, Error>;
 
     /// The [`Mode`] currently in force, as far as this driver can know it.
@@ -497,14 +499,14 @@ pub trait Inverter: Send {
 
 /// Partial applications of the [`Inverter`] operations.
 ///
-/// Sugar only, in two groups. The command methods each build the matching
-/// [`Command`] with [`Command::DEFAULT_HOLD`] and call [`Inverter::apply`]; for a
-/// non-default hold, build the [`Command`] and call `apply` directly. The
-/// `get_*` methods each perform a **full** [`Inverter::read_telemetry`] (or
-/// [`Inverter::mode`]) and return one value — convenient for a one-off
-/// check, wasteful in a loop; when you need several values, read once and
-/// use the fields. The prefix marks the cost: `get_*` talks to hardware,
-/// while same-named accessors on [`Telemetry`] are free field reads.
+/// Sugar only, in two groups. Every non-passive command method requires its
+/// TTL at the call site, builds the matching [`Command`], and calls
+/// [`Inverter::apply`]. The `get_*` methods each perform a **full**
+/// [`Inverter::read_telemetry`] (or [`Inverter::mode`]) and return one value —
+/// convenient for a one-off check, wasteful in a loop; when you need several
+/// values, read once and use the fields. The prefix marks the cost: `get_*`
+/// talks to hardware, while same-named accessors on [`Telemetry`] are free
+/// field reads.
 ///
 /// The blanket implementation is the only one the coherence rules allow, so
 /// no driver can override these — every spelling reaches hardware through
@@ -515,19 +517,21 @@ pub trait InverterExt: Inverter {
         self.apply(Command::passive())
     }
 
-    /// Charge at `power_kw`, importing if necessary.
-    fn charge(&mut self, power_kw: impl Into<f64>) -> Result<Applied, Error> {
-        self.apply(Command::charge(power_kw))
+    /// Charge at `power_kw`, importing if necessary, for at most `ttl`.
+    fn charge(&mut self, power_kw: impl Into<f64>, ttl: Duration) -> Result<Applied, Error> {
+        self.apply(Command::charge(power_kw, ttl))
     }
 
-    /// Discharge at `power_kw` to cover household load, without exporting.
-    fn discharge(&mut self, power_kw: impl Into<f64>) -> Result<Applied, Error> {
-        self.apply(Command::discharge(power_kw))
+    /// Discharge at `power_kw` to cover household load for at most `ttl`,
+    /// without exporting.
+    fn discharge(&mut self, power_kw: impl Into<f64>, ttl: Duration) -> Result<Applied, Error> {
+        self.apply(Command::discharge(power_kw, ttl))
     }
 
-    /// Discharge at `power_kw`, deliberately exporting to the grid.
-    fn export(&mut self, power_kw: impl Into<f64>) -> Result<Applied, Error> {
-        self.apply(Command::export(power_kw))
+    /// Discharge at `power_kw` for at most `ttl`, deliberately exporting to
+    /// the grid.
+    fn export(&mut self, power_kw: impl Into<f64>, ttl: Duration) -> Result<Applied, Error> {
+        self.apply(Command::export(power_kw, ttl))
     }
 
     /// Battery state of charge, percent. Performs a full telemetry read.
@@ -590,6 +594,7 @@ mod tests {
     #[test]
     fn only_a_one_shot_inverter_timeout_survives_a_dead_controller() {
         assert!(Expiry::InverterTimeout(Duration::from_secs(60)).is_dead_controller_safe());
+        assert!(!Expiry::InverterTimeout(Duration::ZERO).is_dead_controller_safe());
         assert!(!Expiry::InverterCondition("target soc").is_dead_controller_safe());
         assert!(!Expiry::RecurringWindow.is_dead_controller_safe());
         assert!(!Expiry::UntilChanged.is_dead_controller_safe());
@@ -597,27 +602,37 @@ mod tests {
 
     #[test]
     fn export_is_distinguishable_from_house_only_discharge() {
-        assert_eq!(Command::discharge(1.5).target, DischargeTarget::HouseOnly);
-        assert_eq!(Command::export(3).target, DischargeTarget::GridExport);
-        assert!(Command::export(3).to_string().contains("grid-export"));
+        let ttl = Duration::from_secs(60);
+        assert_eq!(
+            Command::discharge(1.5, ttl).target,
+            DischargeTarget::HouseOnly
+        );
+        assert_eq!(Command::export(3, ttl).target, DischargeTarget::GridExport);
+        assert!(Command::export(3, ttl).to_string().contains("grid-export"));
     }
 
     #[test]
     fn display_names_the_mode_power_and_export_intent() {
+        let ttl = Duration::from_secs(60);
         assert_eq!(Command::passive().to_string(), "passive");
-        assert_eq!(Command::charge(2).to_string(), "force_charge@2kW");
-        assert_eq!(Command::discharge(1.5).to_string(), "force_discharge@1.5kW");
+        assert_eq!(Command::charge(2, ttl).to_string(), "force_charge@2kW");
         assert_eq!(
-            Command::export(3).to_string(),
+            Command::discharge(1.5, ttl).to_string(),
+            "force_discharge@1.5kW"
+        );
+        assert_eq!(
+            Command::export(3, ttl).to_string(),
             "force_discharge@3kW(grid-export)"
         );
     }
 
     #[test]
-    fn constructors_request_the_default_hold_unless_overridden() {
-        assert_eq!(Command::charge(1.0).hold, Command::DEFAULT_HOLD);
-        let short = Command::charge(1.0).holding_for(Duration::from_secs(60));
-        assert_eq!(short.hold, Duration::from_secs(60));
+    fn non_passive_commands_have_explicit_ttls_but_passive_does_not() {
+        let ttl = Duration::from_secs(60);
+        assert_eq!(Command::charge(1.0, ttl).ttl(), Some(ttl));
+        assert_eq!(Command::discharge(1.0, ttl).ttl(), Some(ttl));
+        assert_eq!(Command::export(1.0, ttl).ttl(), Some(ttl));
+        assert_eq!(Command::passive().ttl(), None);
     }
 
     #[test]
@@ -638,9 +653,10 @@ mod tests {
 
     #[test]
     fn integer_and_float_powers_build_the_same_command() {
-        assert_eq!(Command::charge(2), Command::charge(2.0));
-        assert_eq!(Command::discharge(1), Command::discharge(1.0));
-        assert_eq!(Command::export(3), Command::export(3.0));
+        let ttl = Duration::from_secs(60);
+        assert_eq!(Command::charge(2, ttl), Command::charge(2.0, ttl));
+        assert_eq!(Command::discharge(1, ttl), Command::discharge(1.0, ttl));
+        assert_eq!(Command::export(3, ttl), Command::export(3.0, ttl));
     }
 
     #[test]
