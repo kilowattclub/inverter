@@ -60,6 +60,10 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
+mod factory;
+
+pub use factory::{open, MockOptions, OpenOptions};
+
 pub mod register;
 
 pub mod modbus;

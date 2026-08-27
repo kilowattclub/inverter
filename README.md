@@ -52,6 +52,25 @@ let mut inverter = FoxEss::open_serial("/dev/serial/by-id/usb-...", 9600, 247, &
 let mut inverter = FoxEss::open_tcp("10.0.0.5:502", 247, &registers::H1_G2)?;
 ```
 
+Applications that select a driver from configuration can use the fail-closed
+factory instead:
+
+```rust
+use inverter::{open, MockOptions, OpenOptions};
+
+let mut inverter = open(OpenOptions {
+    kind: "mock",
+    serial_port: "",
+    baud_rate: 9_600,
+    unit_id: 1,
+    mock: MockOptions::default(),
+})?;
+```
+
+The factory recognises `mock`, `mock-relay` and `foxess`. A missing feature,
+unknown driver or hardware connection failure is returned as an error; it
+never substitutes mock telemetry for a failed real inverter.
+
 That's the whole model. Full API reference: [docs.rs/inverter](https://docs.rs/inverter).
 Runnable walkthrough: `cargo run --example tour`.
 
