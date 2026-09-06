@@ -14,7 +14,7 @@ repository = "https://github.com/kilowattclub/inverter"
 readme = "README.md"
 keywords = ["modbus", "inverter", "battery", "solar", "energy"]
 categories = ["hardware-support", "network-programming"]
-include = ["/src", "/examples", "/README.md", "/CHANGELOG.md", "/LICENSE"]
+include = ["/src", "/examples", "/scripts", "/README.md", "/CHANGELOG.md", "/LICENSE"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -35,6 +35,9 @@ thiserror = "2"
 # `libudev` feature avoids a build dependency on libudev-dev.
 serialport = { version = "4", default-features = false, optional = true }
 
+[dev-dependencies]
+signal-hook = "0.3"
+
 [[example]]
 name = "tour"
 required-features = ["mock"]
@@ -42,3 +45,8 @@ required-features = ["mock"]
 [[example]]
 name = "foxess_read"
 required-features = ["foxess", "serial", "tcp"]
+
+[[example]]
+name = "foxess_write"
+path = "scripts/foxess_write.rs"
+required-features = ["foxess", "serial"]

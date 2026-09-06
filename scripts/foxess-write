@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo_dir"
+if command -v cargo >/dev/null 2>&1; then
+    cargo=cargo
+else
+    cargo="$HOME/.cargo/bin/cargo"
+fi
+"$cargo" build --release --example foxess_write
+exec ./target/release/examples/foxess_write "$@"
