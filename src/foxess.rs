@@ -40,6 +40,9 @@ const MODES: &[Mode] = &[
     Mode::ForceDischarge,
 ];
 const MAX_TIMEOUT: Duration = Duration::from_secs(u16::MAX as u64);
+// Match the serial pacing in foxess_modbus. Verified on H1 G2 with
+// Master 1.53 / Manager 1.39; no multi-second settling delay was required.
+const WRITE_DELAY: Duration = Duration::from_millis(30);
 
 /// The registers a FoxESS telemetry read needs, for one model generation.
 ///
@@ -109,9 +112,10 @@ pub mod registers {
     /// Semantics observed in `foxess_modbus`'s
     /// `remote_control_manager.py` and its hardware reports:
     ///
-    /// * Enabling: write [`remote_control::TIMEOUT_SET`], then `1` to
-    ///   [`remote_control::REMOTE_ENABLE`]. These registers reject
-    ///   multi-register writes; use function 6.
+    /// * Enabling can reset [`remote_control::TIMEOUT_SET`] to 60 seconds
+    ///   and resume the previous power setpoint. Clear power while disabled,
+    ///   enable, then set and verify the timeout before applying new power.
+    ///   These registers reject multi-register writes; use function 6.
     /// * While enabled, [`remote_control::ACTIVE_POWER`] sets inverter power:
     ///   positive exports/discharges, negative imports/charges (opposite sign
     ///   to [`crate::Telemetry::battery_kw`] — a write path must negate).
@@ -176,12 +180,14 @@ impl<B: ModbusBus> FoxEss<B> {
     }
 
     fn write(&mut self, reg: &RegisterDef, value: u16) -> Result<(), Error> {
-        with_retries(
+        let result = with_retries(
             &mut self.bus,
             LOG_TARGET,
             &format!("write {}", reg.name),
             |bus| bus.write_holding(reg.address, value),
-        )
+        );
+        std::thread::sleep(WRITE_DELAY);
+        result
     }
 
     fn command_values(command: Command) -> Result<(u16, u16, f64), Error> {
@@ -235,8 +241,19 @@ impl<B: ModbusBus> FoxEss<B> {
         // Cancel the old remote state first. A partially programmed replacement
         // therefore fails passive instead of leaving the previous power active.
         self.return_to_passive()?;
-        self.write(&remote::TIMEOUT_SET, timeout)?;
+        // Enabling can resume the previous setpoint. Neutralise it first.
+        self.write(&remote::ACTIVE_POWER, 0)?;
         self.write(&remote::REMOTE_ENABLE, 1)?;
+        // H1 G2 resets the timeout to 60 on enable, so this must come after it.
+        self.write(&remote::TIMEOUT_SET, timeout)?;
+        let mut timeout_register = remote::TIMEOUT_SET;
+        timeout_register.kind = self.map.battery_soc.kind;
+        let actual_timeout = self.read(&timeout_register)?;
+        if actual_timeout != f64::from(timeout) {
+            return Err(Error::Comm(format!(
+                "FoxESS timeout read-back is {actual_timeout}s, requested {timeout}s"
+            )));
+        }
         // FoxESS loads/reloads the hardware countdown on this write.
         self.write(&remote::ACTIVE_POWER, raw_power)
     }
@@ -384,6 +401,12 @@ mod tests {
         }
         fn write_holding(&mut self, address: u16, value: u16) -> Result<(), Error> {
             self.writes.push((address, value));
+            self.holding.insert(address, vec![value]);
+            self.input.insert(address, vec![value]);
+            if address == registers::remote_control::REMOTE_ENABLE.address && value == 1 {
+                self.holding.insert(44001, vec![60]);
+                self.input.insert(44001, vec![60]);
+            }
             Ok(())
         }
     }
@@ -486,8 +509,9 @@ mod tests {
             [
                 (registers::remote_control::REMOTE_ENABLE.address, 0),
                 (registers::remote_control::WORK_MODE.address, 0),
-                (registers::remote_control::TIMEOUT_SET.address, 60),
+                (registers::remote_control::ACTIVE_POWER.address, 0),
                 (registers::remote_control::REMOTE_ENABLE.address, 1),
+                (registers::remote_control::TIMEOUT_SET.address, 60),
                 (
                     registers::remote_control::ACTIVE_POWER.address,
                     (-2000i16) as u16
@@ -516,8 +540,9 @@ mod tests {
             [
                 (registers::remote_control::REMOTE_ENABLE.address, 0),
                 (registers::remote_control::WORK_MODE.address, 0),
-                (registers::remote_control::TIMEOUT_SET.address, 15),
+                (registers::remote_control::ACTIVE_POWER.address, 0),
                 (registers::remote_control::REMOTE_ENABLE.address, 1),
+                (registers::remote_control::TIMEOUT_SET.address, 15),
                 (registers::remote_control::ACTIVE_POWER.address, 3000),
             ]
         );
@@ -537,8 +562,9 @@ mod tests {
             [
                 (registers::remote_control::REMOTE_ENABLE.address, 0),
                 (registers::remote_control::WORK_MODE.address, 0),
-                (registers::remote_control::TIMEOUT_SET.address, 90),
+                (registers::remote_control::ACTIVE_POWER.address, 0),
                 (registers::remote_control::REMOTE_ENABLE.address, 1),
+                (registers::remote_control::TIMEOUT_SET.address, 90),
                 (registers::remote_control::ACTIVE_POWER.address, 0),
             ]
         );
@@ -589,7 +615,7 @@ mod tests {
             Expiry::InverterTimeout(Duration::from_secs(1))
         );
         assert_eq!(
-            inv.bus.writes[2],
+            inv.bus.writes[4],
             (registers::remote_control::TIMEOUT_SET.address, 1)
         );
     }

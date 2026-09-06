@@ -458,9 +458,12 @@ mod tests {
 
     #[test]
     fn a_full_battery_cannot_accept_more_energy() {
-        let mut inv = MockInverter::new().with_soc_pct(100).with_load_kw(0.4);
+        let mut inv = MockInverter::new().with_load_kw(0.4);
         inv.apply(Command::charge(3, Duration::from_secs(60)))
             .unwrap();
+        // Reach full while charging. Starting full in passive lets real time
+        // before apply() discharge a tiny amount, legitimately allowing charge.
+        inv.soc_pct = 100.0;
         let telemetry = inv.read_telemetry().unwrap();
         assert_eq!(telemetry.battery_kw, 0.0);
         assert_eq!(telemetry.grid_kw, 0.4);

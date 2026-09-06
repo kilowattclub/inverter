@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-09-06
+
+### Fixed
+
+- Fix H1 remote-control TTL programming: clear the old setpoint, enable before
+  setting TTL, pace writes by 30 ms, and verify TTL read-back before applying
+  power. Failures return to passive instead of reporting an unverified timeout.
+- Make the existing full-battery mock test deterministic.
+
+### Added
+
+- Command regression tests for the enable-time timeout reset, ignored timeout
+  writes and failed power writes.
+- Bounded FoxESS commissioning scripts for charge, export and passive commands.
+
+### Changed
+
+- Clarify that FoxESS commands set inverter AC power, while battery losses and
+  separate solar generation change battery and grid measurements.
+
 ## [0.4.1] - 2026-08-27
 
 ### Added

@@ -96,7 +96,7 @@ fn run(
             Expiry::InverterTimeout(duration) if !duration.is_zero() && duration <= ttl => {}
             _ => return Err("driver did not report a bounded hardware timeout".into()),
         }
-        println!("Command acknowledged: {command}; hardware timeout {ttl:?}. This is the requested setpoint, not measured battery power.");
+        println!("Command acknowledged: {command}; hardware timeout {ttl:?}. This is inverter AC power; battery losses, household load and separate solar generation change battery/grid readings.");
         while started.elapsed() < ttl && !stop.load(Ordering::Relaxed) {
             let t = inv.read_telemetry()?;
             report("during", t);

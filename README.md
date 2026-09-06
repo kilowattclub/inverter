@@ -204,14 +204,31 @@ closing the inverter rather than waiting for the hardware timeout.
 | `mock` | ✅ | ✅ | Full simulation with a real one-shot timeout; optional Waveshare 4CH relay indicator with `serial` |
 | `foxess` | ⚠️ community map | ✅ native timeout | H1 G1 (`registers::H1_G1`) and G2 (`registers::H1_G2`) over RS485 |
 
-FoxESS commands use its remote-control registers with Modbus function 6. The
-driver first disables the previous remote command, sets work mode to self-use,
-writes the TTL in whole seconds to `44001`, enables remote control through
-`44000`, then writes active power to `44002`. That last write arms the
-inverter's own countdown. Passive writes `0` to `44000` and self-use to `41000`;
-another command starts the same way, so it cancels and replaces the old
-countdown. Supported TTLs are one through 65,535 seconds; fractional TTLs round
-down so the hardware never outlives the requested command.
+FoxESS commands use Modbus function 6 with 30 ms between writes. The driver
+first disables remote control, selects self-use and clears the previous power
+setpoint. It then enables remote control, writes the TTL in whole seconds to
+`44001`, verifies that it reads back correctly, and writes power to `44002`.
+Enabling **resets the timeout to 60 seconds on H1 G2**, so writing the timeout
+before enabling silently loses it. A failed timeout check or power write
+triggers a best-effort return to passive.
+
+The final power write loads the inverter watchdog. Passive disables remote
+control and selects self-use; a new command cancels and replaces the previous
+one. Supported requested TTLs are one through 65,535 seconds; fractional TTLs
+round down. The firmware countdown, power ramp and telemetry update cadence
+mean the measured power transition need not occur at the exact TTL instant.
+On the commissioned H1 G2 (Master 1.53 / Manager 1.39), a 20-second command
+stopped in the observations around 20–22 seconds without further writes.
+
+FoxESS power requests are **inverter AC power setpoints**, not exact battery
+power or whole-house grid-flow targets. Charging incurs conversion losses;
+grid export also includes separate solar generation and subtracts household
+consumption. For example, approximately 1.04 kW inverter output plus 0.23 kW
+from a separate solar inverter minus 0.18 kW household load gives approximately
+1.09 kW grid export. `Applied.power_kw` is the accepted setpoint, not a measured
+power guarantee. A varying whole-house grid target needs a separate feedback
+controller. `solar_kw` currently reports PV connected directly to FoxESS;
+separate AC solar generation is reflected in the grid meter, but not that field.
 
 `hold()` writes zero active power behind that same watchdog. On expiry the
 inverter returns to passive self-use.
@@ -255,3 +272,29 @@ enabling writes.
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
+
+## Running the tests
+
+From the inverter checkout, with Rust 1.85 or newer:
+
+```sh
+cargo test --all-features
+cargo test --all-features --example foxess_write
+```
+
+These run unit, integration, documentation and commissioning-tool regression
+tests. They do not connect to an inverter or write to hardware. The transport
+test uses a local loopback TCP socket. To run just the FoxESS command tests:
+
+```sh
+cargo test --all-features --test foxess_commands
+```
+
+For formatting and lint checks:
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+Live hardware commissioning is separate: see [scripts/README.md](scripts/README.md).

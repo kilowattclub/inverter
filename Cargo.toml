@@ -1,6 +1,6 @@
 [package]
 name = "inverter"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 # MSRV is capped by serialport's dependency tree (edition 2024); the crate's
 # own code needs much less. Checked by the `msrv` CI job — bump consciously.
@@ -14,7 +14,7 @@ repository = "https://github.com/kilowattclub/inverter"
 readme = "README.md"
 keywords = ["modbus", "inverter", "battery", "solar", "energy"]
 categories = ["hardware-support", "network-programming"]
-include = ["/src", "/examples", "/scripts", "/README.md", "/CHANGELOG.md", "/LICENSE"]
+include = ["/src", "/tests", "/examples", "/scripts", "/README.md", "/CHANGELOG.md", "/LICENSE"]
 
 [package.metadata.docs.rs]
 all-features = true

@@ -26,10 +26,27 @@ completion, telemetry failure, or SIGINT/SIGTERM. Serial operations can delay
 software cleanup; SIGKILL or connection loss relies on the inverter timeout.
 The timeout still needs verification on each supported model/firmware.
 
-Acknowledgement confirms a requested setpoint, not measured battery charging
-power. Compare the printed readings with the inverter screen. Returning to
+Acknowledgement confirms an inverter AC power setpoint. Battery power differs
+because of conversion losses; whole-house grid import/export also includes
+household load and any separate solar inverter. Compare the printed readings with the inverter screen. Returning to
 passive explicitly selects self-use, rather than restoring a previous custom
 work mode. This tool does not enable automatic control in `brain`.
 
 Build without writing using `cargo build --release --example foxess_write`.
 Run its regression tests using `cargo test --example foxess_write`.
+
+The driver clears the old power setpoint before enabling, then sets and verifies
+the TTL after enabling. H1 G2 resets TTL to 60 seconds during enable. Command
+writes are separated by 30 ms; a timeout read-back mismatch aborts the override.
+
+This tool explicitly returns to passive at the end of the requested duration;
+that cleanup is not evidence of native watchdog expiry. The commissioning logs
+in the parent workspace's `analysis/foxess-modes-2026-09-06` directory include
+separate trials that observed expiry before issuing cleanup.
+
+Run the full software suite without touching hardware:
+
+```sh
+cargo test --all-features
+cargo test --all-features --example foxess_write
+```
