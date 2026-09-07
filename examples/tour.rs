@@ -1,6 +1,4 @@
-//! A tour of the whole model on the simulated inverter: read telemetry,
-//! check capabilities, command a charge, and watch the one-shot timeout
-//! revert to passive. No hardware required.
+//! Read telemetry, apply a charge and advance past its timeout on the mock.
 //!
 //! Run with: `cargo run --example tour`
 
@@ -30,9 +28,7 @@ fn main() -> Result<(), inverter::Error> {
         return Ok(());
     }
 
-    // Charge at 2 kW. What the inverter committed to comes back: the power
-    // (possibly clamped) and — the crate's reason to exist — how the
-    // command will end.
+    // Apply a 2 kW charge with a five-minute timeout.
     let applied = inverter.charge(2, Duration::from_secs(300))?;
     println!(
         "charging: {} kW, ends by {:?}",
@@ -40,9 +36,7 @@ fn main() -> Result<(), inverter::Error> {
     );
     assert!(applied.expiry.is_dead_controller_safe());
 
-    // Six simulated minutes later the five-minute TTL has lapsed and the
-    // inverter has reverted by itself — no controller involved. That is
-    // what a real fail-safe looks like.
+    // Advance past the timeout.
     inverter.advance(Duration::from_secs(360));
     println!("later:    mode is {} again", inverter.get_mode()?);
 
@@ -52,8 +46,7 @@ fn main() -> Result<(), inverter::Error> {
     println!("planned:  {command}");
     inverter.apply(command)?;
 
-    // And passive is the safe floor: no power, nothing to expire, always
-    // safe to hand back early.
+    // Cancel the override.
     inverter.passive()?;
     Ok(())
 }

@@ -1,11 +1,7 @@
 //! A simulated inverter.
 //!
-//! Useful for tests and for running a controller with no hardware attached.
-//! It deliberately models the *well-behaved* case: commands carry a real
-//! one-shot timeout and the inverter reverts to passive on its own when that
-//! elapses. Code that works against the mock and breaks against a real
-//! inverter has usually assumed a fail-safe the hardware does not provide —
-//! check [`Capabilities::expiry`] rather than trusting the mock's guarantee.
+//! Models battery limits, household load, solar and one-shot command expiry.
+//! [`MockInverter::advance`] adds simulated time without sleeping.
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -27,14 +23,8 @@ const MODES: &[Mode] = &[
 
 /// A simulated battery and inverter.
 ///
-/// The simulation runs on one clock: real time flows into it on every
-/// interaction, and [`MockInverter::advance`] adds simulated time on top.
-/// A command's TTL elapses on that same clock, so a test can watch the
-/// one-shot timeout revert without sleeping.
-///
-/// Builder inputs are clamped to physically meaningful values rather than
-/// poisoning the arithmetic — a non-positive capacity becomes 1 Wh, negative
-/// powers become zero, and `NaN` falls to the nearest bound.
+/// Real elapsed time and [`MockInverter::advance`] use the same simulation clock.
+/// Builder inputs are clamped to the documented bounds.
 pub struct MockInverter {
     capacity_kwh: f64,
     max_power_kw: f64,
@@ -111,11 +101,7 @@ impl MockInverter {
 
     /// Advance the simulation by `elapsed` without waiting for real time.
     ///
-    /// The command's TTL elapses in simulated time too: advancing past it
-    /// integrates the battery up to the expiry boundary, reverts to passive,
-    /// and runs the remainder passively — exactly what the real hardware the
-    /// mock stands in for would have done. Tests should drive the model with
-    /// this rather than sleeping.
+    /// If the TTL expires during the step, the remainder runs in passive mode.
     pub fn advance(&mut self, elapsed: Duration) {
         self.sync();
         self.step(elapsed);
@@ -124,7 +110,7 @@ impl MockInverter {
     /// The command currently in force, accounting for an elapsed timeout.
     #[must_use]
     pub fn active_command(&self) -> Command {
-        let since = self.since_command + self.last_sync.elapsed();
+        let since = self.since_command.saturating_add(self.last_sync.elapsed());
         if self.command.ttl().is_some_and(|ttl| since >= ttl) {
             Command::passive()
         } else {
@@ -175,7 +161,6 @@ impl MockInverter {
             if remaining >= until_expiry {
                 self.integrate(until_expiry);
                 remaining -= until_expiry;
-                // A real one-shot timeout: the inverter reverts by itself.
                 self.command = Command::passive();
                 self.since_command = Duration::ZERO;
             }
@@ -210,15 +195,6 @@ impl Inverter for MockInverter {
         let load_kw = self.baseline_load_kw;
         // AC balance: what the house and battery need beyond PV comes from the grid.
         let grid_kw = load_kw + battery_kw - self.solar_kw;
-        let grid_kw = if self.command.mode == Mode::ForceDischarge
-            && self.command.target == DischargeTarget::HouseOnly
-        {
-            // Without an export path, discharge cannot push past the load.
-            grid_kw.max(0.0)
-        } else {
-            grid_kw
-        };
-
         Ok(Telemetry {
             soc_pct: self.soc_pct,
             battery_kw,
@@ -230,23 +206,24 @@ impl Inverter for MockInverter {
         })
     }
 
-    fn apply(&mut self, command: Command) -> Result<Applied, Error> {
-        if !self.capabilities().supports(command.mode) {
-            return Err(Error::Unsupported(format!(
-                "mock does not support {}",
-                command.mode.as_str()
-            )));
+    fn apply(&mut self, mut command: Command) -> Result<Applied, Error> {
+        // Public fields can be edited after construction. Recheck the TTL and
+        // discard fields that do not apply to the selected mode.
+        if command.mode == Mode::Passive {
+            command = Command::passive();
+        } else if !command.ttl().is_some_and(|ttl| !ttl.is_zero()) {
+            return Err(Error::Range(
+                "non-passive command requires a non-zero TTL".into(),
+            ));
+        }
+        if command.mode == Mode::Hold {
+            command.power_kw = 0.0;
         }
         if !command.power_kw.is_finite() || command.power_kw < 0.0 {
             return Err(Error::Range(format!(
                 "power must be finite and non-negative, got {}",
                 command.power_kw
             )));
-        }
-        if command.mode != Mode::Passive && command.ttl().is_some_and(|ttl| ttl.is_zero()) {
-            return Err(Error::Range(
-                "non-passive command TTL must be greater than zero".into(),
-            ));
         }
         self.sync();
 
@@ -260,7 +237,6 @@ impl Inverter for MockInverter {
         })
     }
 
-    // The mock genuinely knows its mode: it is the hardware, timeout included.
     fn mode(&mut self) -> Result<Mode, Error> {
         self.sync();
         Ok(self.command.mode)
@@ -399,7 +375,7 @@ mod tests {
         inv.apply(Command::charge(1, Duration::from_millis(1)))
             .unwrap();
         std::thread::sleep(Duration::from_millis(5));
-        // No advance() or read in between: the answer must still be honest.
+        // Expiry must be visible without an intervening read or advance.
         assert_eq!(inv.active_command().mode, Mode::Passive);
     }
 
@@ -499,6 +475,54 @@ mod tests {
             .apply(Command::charge(-1.0, Duration::from_secs(60)))
             .is_err());
         assert!(inv.apply(Command::charge(1, Duration::ZERO)).is_err());
+    }
+
+    #[test]
+    fn an_override_without_a_ttl_is_rejected_without_changing_state() {
+        let mut inv = MockInverter::new();
+        let previous = Command::hold(Duration::from_secs(60));
+        inv.apply(previous).unwrap();
+        for mode in [Mode::Hold, Mode::ForceCharge, Mode::ForceDischarge] {
+            let mut command = Command::passive();
+            command.mode = mode;
+            command.power_kw = 1.0;
+            assert!(matches!(inv.apply(command), Err(Error::Range(_))));
+            assert_eq!(inv.active_command(), previous);
+        }
+    }
+
+    #[test]
+    fn passive_clears_an_existing_ttl_and_ignores_power() {
+        let mut inv = MockInverter::new();
+        let mut command = Command::charge(f64::NAN, Duration::from_secs(60));
+        command.mode = Mode::Passive;
+        let applied = inv.apply(command).unwrap();
+        assert_eq!(applied.expiry, Expiry::UntilChanged);
+        assert_eq!(applied.power_kw, 0.0);
+        assert_eq!(inv.active_command(), Command::passive());
+
+        let mut command = Command::hold(Duration::from_secs(60));
+        command.power_kw = f64::NAN;
+        assert_eq!(inv.apply(command).unwrap().power_kw, 0.0);
+        assert_eq!(inv.read_telemetry().unwrap().battery_kw, 0.0);
+    }
+
+    #[test]
+    fn house_only_discharge_preserves_surplus_solar_export() {
+        let mut inv = MockInverter::new().with_load_kw(0.5).with_solar_kw(2.0);
+        inv.apply(Command::discharge(3, Duration::from_secs(60)))
+            .unwrap();
+        let t = inv.read_telemetry().unwrap();
+        assert_eq!(t.battery_kw, 0.0);
+        assert_eq!(t.grid_kw, -1.5);
+        assert_eq!(t.grid_kw + t.solar_kw, t.load_kw + t.battery_kw);
+    }
+
+    #[test]
+    fn maximum_elapsed_time_does_not_overflow_active_command() {
+        let mut inv = MockInverter::new();
+        inv.advance(Duration::MAX);
+        assert_eq!(inv.active_command(), Command::passive());
     }
 
     #[test]

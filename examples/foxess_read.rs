@@ -6,12 +6,10 @@
 //!   cargo run --example foxess_read -- serial /dev/serial/by-id/usb-... [g1|g2]
 //!   cargo run --example foxess_read -- tcp 10.0.0.5:502 [g1|g2]
 //!
-//! The register maps are community-sourced and unverified. Running this
-//! read-only check against a real unit — and comparing every number with the
-//! inverter's own display — is exactly the verification the README asks for.
+//! Compare readings with the inverter display to verify the selected map.
 
 use inverter::foxess::{registers, FoxEss, RegisterMap};
-use inverter::{Inverter, InverterExt};
+use inverter::Inverter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -39,8 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("load:    {:>6.2} kW", t.load_kw);
     println!("solar:   {:>6.2} kW", t.solar_kw);
 
-    // Single-value sugar performs a full read; fine for a one-off check.
-    println!("export:  {:>6.2} kW", inverter.get_export_kw()?);
+    println!("export:  {:>6.2} kW", t.export_kw());
     Ok(())
 }
 

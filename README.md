@@ -4,12 +4,8 @@
 [![crates.io](https://img.shields.io/crates/v/inverter.svg)](https://crates.io/crates/inverter)
 [![docs.rs](https://img.shields.io/docsrs/inverter)](https://docs.rs/inverter)
 
-Control hybrid solar/battery inverters over Modbus, from Rust.
-
-You open a driver, read telemetry from it, and call command methods on it.
-Every accepted command tells you **how it will end** — because a command the
-inverter reverts by itself is a fail-safe, and a daily schedule that happens
-to end at the same time is not.
+Rust drivers for hybrid solar/battery inverters over Modbus. Supports FoxESS
+H1 G1/G2 and a simulated inverter.
 
 ## Usage
 
@@ -18,283 +14,139 @@ cargo add inverter
 ```
 
 ```rust
-use inverter::{Inverter, InverterExt, mock::MockInverter};
+use inverter::{mock::MockInverter, Inverter, InverterExt};
 use std::time::Duration;
 
-// 1. Open a driver. The mock needs no hardware:
 let mut inverter = MockInverter::new();
-
-// 2. Read telemetry — everything at once, or single values:
 let t = inverter.read_telemetry()?;
 println!("{:.0}%  battery {:+.2} kW  grid {:+.2} kW", t.soc_pct, t.battery_kw, t.grid_kw);
 
-let soc = inverter.get_soc_pct()?;    // one field, one call
-let mode = inverter.get_mode()?;      // the Mode currently in force
-
-// 3. Every override has an explicit TTL. Powers are kilowatts:
 let ttl = Duration::from_secs(60);
-inverter.hold(ttl)?;             // reserve the battery at zero power
-inverter.charge(2, ttl)?;        // charge at 2 kW, importing if needed
-inverter.discharge(1.5, ttl)?;   // cover household load only; no export
-inverter.export(3, ttl)?;        // deliberately export to the grid
-inverter.passive()?;        // back to the inverter's own self-use
+let applied = inverter.charge(2, ttl)?;
+println!("{} kW, {:?}", applied.power_kw, applied.expiry);
+inverter.passive()?;
 ```
 
-Real hardware instead of the mock:
+FoxESS connections:
 
 ```rust
 use inverter::foxess::{registers, FoxEss};
 
-// RS485 adapter (use a stable by-id path, not /dev/ttyUSB0):
 let mut inverter = FoxEss::open_serial("/dev/serial/by-id/usb-...", 9600, 247, &registers::H1_G2)?;
-
-// or through an RS485-to-network bridge (Elfin EW11 and similar):
+// Or a bridge configured for Modbus TCP:
 let mut inverter = FoxEss::open_tcp("10.0.0.5:502", 247, &registers::H1_G2)?;
 ```
 
-Applications that select a driver from configuration can use the fail-closed
-factory instead:
+Use `open(OpenOptions { ... })` to select `mock`, `mock-relay` or `foxess`
+from configuration. The factory uses H1 G2 for FoxESS; `unit_id: 0` selects
+247. Unknown drivers, missing features and connection failures return errors.
 
-```rust
-use inverter::{open, MockOptions, OpenOptions};
+[API reference](https://docs.rs/inverter) · `cargo run --example tour`
 
-let mut inverter = open(OpenOptions {
-    kind: "mock",
-    serial_port: "",
-    baud_rate: 9_600,
-    unit_id: 1,
-    mock: MockOptions::default(),
-})?;
-```
+## Commands
 
-The factory recognises `mock`, `mock-relay` and `foxess`. A missing feature,
-unknown driver or hardware connection failure is returned as an error; it
-never substitutes mock telemetry for a failed real inverter.
-
-That's the whole model. Full API reference: [docs.rs/inverter](https://docs.rs/inverter).
-Runnable walkthrough: `cargo run --example tour`.
-
-## What each command does
-
-| Command | The inverter... |
+| Method | Behaviour |
 |---|---|
-| `passive()` | runs its **own self-use logic**, exactly as if no controller were attached: solar powers the house, surplus charges the battery then exports, and after dark the battery covers the house down to its minimum SoC. Vendors call this "self-use" or "self-consumption". |
-| `hold(ttl)` | **keeps battery power at zero**, reserving stored energy while the grid or solar serves the house. |
-| `charge(kw, ttl)` | **forces energy into the battery** at `kw`, importing from the grid when solar can't cover it — how a controller buys a cheap tariff window. |
-| `discharge(kw, ttl)` | **forces energy out of the battery** at `kw`, but only to cover the household load — nothing is pushed past the meter. |
-| `export(kw, ttl)` | **forces energy out of the battery and past the meter** at `kw`, deliberately exporting — for things like grid-services events. |
+| `passive()` | Return to the inverter's self-use mode. |
+| `hold(ttl)` | Keep battery power at zero. |
+| `charge(kw, ttl)` | Charge, importing from the grid as needed. |
+| `discharge(kw, ttl)` | Discharge to cover net household load. |
+| `export(kw, ttl)` | Discharge with grid export permitted. |
 
-Passive is the safe floor: it has no power level and nothing to expire, so
-it is always safe to command, and it is what a dead controller's hardware
-should decay to. The four overrides are the commands that need the expiry
-semantics below.
+Commands return `Applied`: the accepted power setpoint and expiry. They can
+also be built as `Command` values and passed to `Inverter::apply`.
 
-## How a command ends
+Every override requires a non-zero TTL. Drivers must provide a one-shot
+inverter timeout, replace it on a new command, and cancel it on passive.
+Unsupported commands return an error. `capabilities()` lists supported modes,
+maximum timeout and telemetry support; discharge-target support varies by driver.
 
-Every command method returns what the inverter actually committed to:
+`Expiry` distinguishes an inverter timeout from a condition, recurring schedule
+or persistent setting. Only a non-zero `InverterTimeout` passes
+`is_dead_controller_safe()`. Passive returns `UntilChanged`.
 
-```rust
-let applied = inverter.charge(2, Duration::from_secs(60))?;
+The hardware timeout survives controller failure. Applications should also
+request passive on SIGINT/SIGTERM. Power limits, SoC limits and export limits
+are the controller's responsibility.
 
-applied.power_kw;  // possibly clamped by the hardware
-applied.expiry;    // how this command ends — the crate's reason to exist
-```
+## Telemetry
 
-```rust
-pub enum Expiry {
-    InverterTimeout(Duration),       // reverts by itself, once. A real dead-man's handle.
-    InverterCondition(&'static str), // reverts on a condition, e.g. target SoC. Not time-bounded.
-    RecurringWindow,                 // repeats daily. NOT a fail-safe.
-    UntilChanged,                    // stands until overwritten. NOT a fail-safe.
-}
-```
-
-If your controller could die mid-command, check before commanding:
-
-```rust
-if !inverter.capabilities().expiry.is_dead_controller_safe() {
-    // A dead controller would leave this command standing. Don't issue it.
-}
-```
-
-## Check capabilities before commanding
-
-Support varies by model *and* connection route. A driver that cannot write
-says so up front, with a reason, instead of failing when you needed it:
-
-```rust
-use inverter::Mode;
-
-let caps = inverter.capabilities();
-if caps.supports(Mode::ForceCharge) {
-    inverter.charge(2, Duration::from_secs(60))?;
-} else {
-    println!("no writes: {}", caps.write_blocked_reason.unwrap_or("unsupported"));
-}
-```
-
-## Units and sign conventions
-
-All powers are **kilowatts** (energies kilowatt-hours), and the same signs
-come from every driver, whatever the inverter's native convention:
-
-| Field | Meaning |
+| Field | Units and sign |
 |---|---|
-| `battery_kw > 0` | charging (power into the cells) |
-| `grid_kw > 0` | importing; `< 0` exporting |
-| `load_kw >= 0` | household consumption |
-| `solar_kw >= 0` | PV generation, `0.0` when unavailable |
+| `soc_pct` | Battery state of charge, percent |
+| `battery_kw` | Positive when charging, negative when discharging |
+| `grid_kw` | Positive when importing, negative when exporting |
+| `load_kw` | Household consumption, non-negative |
+| `solar_kw` | PV generation, non-negative; zero when unavailable |
 
-`t.export_kw()` gives grid export as a positive number; `t.age()` is a
-monotonic staleness check that NTP steps cannot corrupt.
+`export_kw()` returns grid export as a positive value. `age()` uses a monotonic
+clock. FoxESS timestamps the start of a telemetry read so retries count towards
+its age; the fields are read sequentially.
 
-For a one-off value there are `get_*` methods — sugar over
-`read_telemetry`, so each call performs a full read; batch with
-`read_telemetry` when you need several. The prefix marks the cost:
-`get_*` talks to hardware, plain accessors on `Telemetry` are free.
+Each `get_*` telemetry method performs a full read. Use `read_telemetry()` once
+when several values are needed. `get_mode()` reads the current mode or returns
+`Unsupported`; FoxESS does not currently support mode read-back.
 
-```rust
-let soc = inverter.get_soc_pct()?;
-let export = inverter.get_export_kw()?;
-```
+## FoxESS
 
-`inverter.get_mode()?` asks which `Mode` is currently in force. A driver that
-cannot read that back from the hardware errors instead of repeating its last
-command — a stale answer would hide an expired or externally-changed
-command — and `capabilities().reports_mode` says up front whether it can
-answer. The mock answers exactly (it simulates the timeout); FoxESS is
-`Unsupported` until its remote-control registers are verified readable.
+Select `registers::H1_G1` for first-generation H1/AC1/AIO-H1 input registers,
+or `registers::H1_G2` for H1-G2/AC1-G2/P1 holding registers. Both use RS485,
+directly or through a Modbus TCP bridge. The inverter's built-in LAN map is
+unsupported.
 
-## Commands as data
+The maps come from [foxess_modbus](https://github.com/nathanmarlor/foxess_modbus).
+Check telemetry and timeout behaviour on the installed model and firmware.
+The H1 G2 watchdog was tested on Master 1.53 / Manager 1.39.
 
-The methods above are sugar over one underlying operation,
-`apply(Command)`. Build `Command` values directly when commands come from a
-planner or pass through a safety layer before reaching hardware — they can
-be stored, compared, logged and applied later:
+Commands use function 6, with 30 ms between writes:
 
-```rust
-use inverter::Command;
-use std::time::Duration;
+1. Disable remote control, select self-use and clear the old power setpoint.
+2. Enable remote control, then set and read back the TTL at `44001`.
+3. Write power to `44002`, loading the watchdog.
 
-let cmd = Command::charge(2, Duration::from_secs(60));
-inverter.apply(cmd)?;
-```
+H1 G2 resets the timeout to 60 seconds when enabled, so the TTL must be written
+afterwards. Programming failures trigger a best-effort return to passive.
+Requested TTLs range from 1 to 65,535 seconds; fractions round down. Firmware
+countdown, power ramp and telemetry cadence affect the observed stopping time.
 
-Both spellings reach hardware through `apply`; drivers cannot make them
-diverge.
+Power commands set **inverter AC power**. Battery losses, household load and
+separate solar generation affect measured battery and grid power.
+`Applied.power_kw` is a setpoint, not a measured grid-flow guarantee.
+`solar_kw` includes only PV connected directly to FoxESS.
 
-## Hardware TTL and shutdown
+`hold()` uses zero remote active power. `discharge()` is unsupported because
+this control cannot guarantee house-only discharge as load changes; use
+`export()` for export-capable discharge. Expiry returns to self-use.
 
-Non-passive commands cannot be constructed without a TTL. `passive()` is the
-only command that does not take one.
+Remote charging does not respect the inverter's maximum SoC setting; the
+controller must enforce it. Remote discharge respects minimum SoC and maximum
+discharge current. FoxESS app strategy periods can overwrite these commands.
 
-Each driver must arm a one-shot timeout in the inverter itself. A new command
-replaces the previous hardware timeout; passive cancels it. A driver that
-cannot do this must refuse the non-passive command without changing state.
+## Mock and relay indicator
 
-Because the timeout runs in the inverter, it survives SIGKILL, a crash, or
-power loss to the controller. Process lifecycle remains application policy:
-on SIGTERM or SIGINT, the application should apply `Command::passive()` before
-closing the inverter rather than waiting for the hardware timeout.
+`MockInverter` simulates battery limits, household load, solar and command expiry.
+It advances with real time; `advance(Duration)` adds simulated time for tests.
 
-## Drivers
+With `mock` and `serial`, `with_waveshare_relay` attaches a Waveshare Modbus RTU
+Relay 4CH indicator: CH1 passive, CH2 charge, CH3 house-only discharge, CH4 export,
+all off for hold. The indicator refreshes on driver calls; it has no independent
+hardware timeout. `close()` switches all channels off.
 
-| Driver | Reads | Writes | Notes |
-|---|---|---|---|
-| `mock` | ✅ | ✅ | Full simulation with a real one-shot timeout; optional Waveshare 4CH relay indicator with `serial` |
-| `foxess` | ⚠️ community map | ✅ native timeout | H1 G1 (`registers::H1_G1`) and G2 (`registers::H1_G2`) over RS485 |
+## Build and test
 
-FoxESS commands use Modbus function 6 with 30 ms between writes. The driver
-first disables remote control, selects self-use and clears the previous power
-setpoint. It then enables remote control, writes the TTL in whole seconds to
-`44001`, verifies that it reads back correctly, and writes power to `44002`.
-Enabling **resets the timeout to 60 seconds on H1 G2**, so writing the timeout
-before enabling silently loses it. A failed timeout check or power write
-triggers a best-effort return to passive.
-
-The final power write loads the inverter watchdog. Passive disables remote
-control and selects self-use; a new command cancels and replaces the previous
-one. Supported requested TTLs are one through 65,535 seconds; fractional TTLs
-round down. The firmware countdown, power ramp and telemetry update cadence
-mean the measured power transition need not occur at the exact TTL instant.
-On the commissioned H1 G2 (Master 1.53 / Manager 1.39), a 20-second command
-stopped in the observations around 20–22 seconds without further writes.
-
-FoxESS power requests are **inverter AC power setpoints**, not exact battery
-power or whole-house grid-flow targets. Charging incurs conversion losses;
-grid export also includes separate solar generation and subtracts household
-consumption. For example, approximately 1.04 kW inverter output plus 0.23 kW
-from a separate solar inverter minus 0.18 kW household load gives approximately
-1.09 kW grid export. `Applied.power_kw` is the accepted setpoint, not a measured
-power guarantee. A varying whole-house grid target needs a separate feedback
-controller. `solar_kw` currently reports PV connected directly to FoxESS;
-separate AC solar generation is reflected in the grid meter, but not that field.
-
-`hold()` writes zero active power behind that same watchdog. On expiry the
-inverter returns to passive self-use.
-
-FoxESS active-power control can force charge or deliberate grid export, but it
-cannot guarantee house-only discharge as load changes. The driver therefore
-refuses `discharge()` and accepts `export()` when export is intended. The maps
-come from the community-tested `foxess_modbus` integration and remain sensitive
-to model, firmware and connection route. This crate covers the H1-family RS485
-map directly or through an RS485-to-TCP bridge, not the inverter's reduced
-built-in LAN map. Confirm the addresses against your exact hardware before use.
-
-New drivers implement the `Inverter` trait over any `modbus::ModbusBus`,
-with addresses kept as data via `register::RegisterDef` — see the
-`register` and `modbus` module docs.
-
-## Features
-
-`serial`, `tcp`, `foxess`, `mock` — all on by default, every combination
-builds and is tested in CI. The crate is synchronous by design: Modbus over
-a serial line does not benefit from async, and a blocking API keeps a
-runtime out of your dependency tree.
-
-With both `mock` and `serial`, call `MockInverter::with_waveshare_relay` to
-show its current command on a Waveshare Modbus RTU Relay 4CH: passive on CH1,
-charge on CH2, house-only discharge on CH3 and grid export on CH4. This is a
-mode indicator only; the mock remains the source of telemetry and TTL behavior.
-
-The minimum supported Rust version is **1.85**, checked in CI; it is set by
-the serial stack's dependencies, not by this crate's own code.
-
-## Safety
-
-Power caps, SoC floors, export caps and process lifecycle remain policy for the
-system deciding what to command. Drivers own command lifetime because only the
-inverter's native timeout survives controller failure. The crate never quietly
-reports a plausible number in place of a failed read, and never claims a
-stronger expiry than the hardware provides. Verify your register map before
-enabling writes.
-
-## Licence
-
-MIT. See [LICENSE](LICENSE).
-
-## Running the tests
-
-From the inverter checkout, with Rust 1.85 or newer:
+Requires Rust 1.85 or newer. Features `serial`, `tcp`, `foxess` and `mock` are
+enabled by default. The API is synchronous.
 
 ```sh
 cargo test --all-features
 cargo test --all-features --example foxess_write
-```
-
-These run unit, integration, documentation and commissioning-tool regression
-tests. They do not connect to an inverter or write to hardware. The transport
-test uses a local loopback TCP socket. To run just the FoxESS command tests:
-
-```sh
-cargo test --all-features --test foxess_commands
-```
-
-For formatting and lint checks:
-
-```sh
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Live hardware commissioning is separate: see [scripts/README.md](scripts/README.md).
+Tests use simulated devices and a loopback TCP socket. For hardware tests, see
+[scripts/README.md](scripts/README.md).
+
+## Licence
+
+[MIT](LICENSE).
