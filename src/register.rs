@@ -81,7 +81,11 @@ impl RegisterDef {
 /// Panics unless the definition spans 1–4 words and `words` has that length.
 pub fn decode(reg: &RegisterDef, words: &[u16]) -> f64 {
     assert!((1..=4).contains(&reg.words), "register must span 1–4 words");
-    assert_eq!(words.len(), usize::from(reg.words), "register width mismatch");
+    assert_eq!(
+        words.len(),
+        usize::from(reg.words),
+        "register width mismatch"
+    );
     let mut raw: u64 = 0;
     for &w in words {
         raw = (raw << 16) | u64::from(w);

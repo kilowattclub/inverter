@@ -73,7 +73,7 @@ pub enum Error {
     #[error("communication error: {0}")]
     Comm(String),
 
-    /// A write succeeded but reading the register back returned another value.
+    /// A write acknowledgement or register read-back did not match the request.
     #[error("read-back mismatch: {0}")]
     Readback(String),
 

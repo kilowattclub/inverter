@@ -171,9 +171,7 @@ mod stream {
             address: u16,
             words: u8,
         ) -> Result<Vec<u16>, Error> {
-            if !(1..=125).contains(&words)
-                || address.checked_add(u16::from(words) - 1).is_none()
-            {
+            if !(1..=125).contains(&words) || address.checked_add(u16::from(words) - 1).is_none() {
                 return Err(Error::Range("invalid modbus register range".into()));
             }
             let mut builder = self.request();
