@@ -147,6 +147,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 Tests use simulated devices and a loopback TCP socket. For hardware tests, see
 [scripts/README.md](scripts/README.md).
 
+## Publishing
+
+Configure a crates.io trusted publisher for `kilowattclub/inverter`, workflow
+`publish.yml`, with no environment. Bump the version and changelog, merge to
+`main`, then run **Publish crate** in GitHub Actions. The workflow tests,
+checks the package and publishes with a temporary crates.io token.
+
 ## Licence
 
 [MIT](LICENSE).
