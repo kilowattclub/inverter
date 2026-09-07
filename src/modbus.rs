@@ -1,10 +1,7 @@
 //! Modbus transports.
 //!
-//! Two ways to reach the same registers: RTU over a serial adapter wired to
-//! the inverter, or TCP to a serial bridge sitting beside it. Drivers are
-//! written against [`ModbusBus`] and do not care which is in use. The trait
-//! and its helpers are always compiled; the concrete transports sit behind
-//! the `serial` and `tcp` features.
+//! [`ModbusBus`] abstracts serial RTU and Modbus TCP connections. Concrete
+//! transports require the `serial` or `tcp` feature.
 
 use std::time::Duration;
 
@@ -24,9 +21,7 @@ pub trait ModbusBus: Send {
     fn write_holding(&mut self, address: u16, value: u16) -> Result<(), Error>;
 }
 
-/// Read a register definition's words, rejecting short replies.
-///
-/// A truncated reply decodes to plausible zeroes, which is worse than an error.
+/// Read the exact number of words in a register definition.
 pub fn read_words(bus: &mut dyn ModbusBus, reg: &RegisterDef) -> Result<Vec<u16>, Error> {
     let words = match reg.kind {
         RegKind::Input => bus.read_input(reg.address, reg.words)?,
@@ -43,10 +38,7 @@ pub fn read_words(bus: &mut dyn ModbusBus, reg: &RegisterDef) -> Result<Vec<u16>
     Ok(words)
 }
 
-/// Run a bus operation, retrying with exponential backoff.
-///
-/// Serial lines drop frames; a single failure is not evidence of a broken
-/// inverter. Persistent failure is, and is reported.
+/// Run up to three attempts, with 500 ms and 1 s delays between failures.
 pub fn with_retries<B: ModbusBus + ?Sized, R>(
     bus: &mut B,
     log_target: &str,
@@ -99,9 +91,17 @@ mod stream {
         pub(super) stream: S,
         pub(super) unit: u8,
         pub(super) proto: ModbusProto,
+        pub(super) transaction_id: u16,
     }
 
     impl<S: ModbusStream> StreamBus<S> {
+        fn request(&mut self) -> ModbusRequest {
+            self.transaction_id = self.transaction_id.wrapping_add(1);
+            let mut request = ModbusRequest::new(self.unit, self.proto);
+            request.tr_id = self.transaction_id;
+            request
+        }
+
         fn transact<T>(
             &mut self,
             request: &[u8],
@@ -118,37 +118,49 @@ mod stream {
 
             // Replies arrive in pieces; accumulate until the frame is complete.
             let deadline = Instant::now() + READ_DEADLINE;
-            let mut buf: Vec<u8> = Vec::with_capacity(256);
-            let mut chunk = [0u8; 256];
+            let mut buf = Vec::with_capacity(260);
+            let mut chunk = [0u8; 260];
+            let header_len = if self.proto == ModbusProto::TcpUdp {
+                6
+            } else {
+                3
+            };
+            let mut frame_len = header_len;
             loop {
-                let n = self
-                    .stream
-                    .read(&mut chunk)
-                    .map_err(|e| Error::Comm(format!("modbus read failed: {e}")))?;
-                if n == 0 {
-                    return Err(Error::Comm("empty modbus response".into()));
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                // guess_response_frame_len panics below these lengths; a slow
-                // line can legitimately deliver fewer bytes in the first read.
-                let min_guess = match self.proto {
-                    ModbusProto::TcpUdp => 6,
-                    _ => 3,
-                };
-                if buf.len() >= min_guess {
-                    if let Ok(frame_len) = rmodbus::guess_response_frame_len(&buf, self.proto) {
-                        if buf.len() >= frame_len as usize {
-                            buf.truncate(frame_len as usize);
-                            break;
-                        }
-                    }
-                }
                 if Instant::now() >= deadline {
                     return Err(Error::Comm(format!(
                         "incomplete modbus response ({} bytes) before deadline",
                         buf.len()
                     )));
                 }
+                let n = self
+                    .stream
+                    .read(&mut chunk[..frame_len - buf.len()])
+                    .map_err(|e| Error::Comm(format!("modbus read failed: {e}")))?;
+                if n == 0 {
+                    return Err(Error::Comm("empty modbus response".into()));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() < frame_len {
+                    continue;
+                }
+                if frame_len != header_len {
+                    break;
+                }
+                frame_len = if self.proto == ModbusProto::TcpUdp {
+                    let length = usize::from(u16::from_be_bytes([buf[4], buf[5]]));
+                    if buf[2..4] != [0, 0] || !(3..=254).contains(&length) {
+                        return Err(Error::Comm("invalid modbus TCP header".into()));
+                    }
+                    6 + length
+                } else {
+                    match buf[1] {
+                        3 | 4 => 5 + usize::from(buf[2]),
+                        6 => 8,
+                        0x80..=0xff => 5,
+                        _ => return Err(Error::Comm("invalid modbus response function".into())),
+                    }
+                };
             }
             parse(&buf)
         }
@@ -159,7 +171,12 @@ mod stream {
             address: u16,
             words: u8,
         ) -> Result<Vec<u16>, Error> {
-            let mut builder = ModbusRequest::new(self.unit, self.proto);
+            if !(1..=125).contains(&words)
+                || address.checked_add(u16::from(words) - 1).is_none()
+            {
+                return Err(Error::Range("invalid modbus register range".into()));
+            }
+            let mut builder = self.request();
             let mut request = Vec::new();
             let built = match kind {
                 RegKind::Input => builder.generate_get_inputs(address, words.into(), &mut request),
@@ -169,6 +186,22 @@ mod stream {
             };
             built.map_err(|e| Error::Comm(format!("frame build failed: {e:?}")))?;
             self.transact(&request, move |buf| {
+                // Validate length before parse_u16: an empty payload can panic
+                // in rmodbus, and extra words would otherwise be truncated.
+                let payload = builder
+                    .parse_slice(buf)
+                    .map_err(|e| Error::Comm(format!("modbus read error at {address}: {e:?}")))?;
+                let offset = if builder.proto == ModbusProto::TcpUdp {
+                    6
+                } else {
+                    0
+                };
+                let expected = usize::from(words) * 2;
+                if payload.len() != expected || usize::from(buf[offset + 2]) != expected {
+                    return Err(Error::Comm(format!(
+                        "invalid modbus read length at {address}: expected {expected} bytes"
+                    )));
+                }
                 let mut out = Vec::new();
                 builder
                     .parse_u16(buf, &mut out)
@@ -188,15 +221,22 @@ mod stream {
         }
 
         fn write_holding(&mut self, address: u16, value: u16) -> Result<(), Error> {
-            let mut builder = ModbusRequest::new(self.unit, self.proto);
+            let mut builder = self.request();
             let mut request = Vec::new();
             builder
                 .generate_set_holding(address, value, &mut request)
                 .map_err(|e| Error::Comm(format!("frame build failed: {e:?}")))?;
             self.transact(&request, move |buf| {
-                builder
-                    .parse_ok(buf)
+                let response = builder
+                    .parse_slice(buf)
                     .map_err(|e| Error::Comm(format!("modbus write error at {address}: {e:?}")))?;
+                let [address_hi, address_lo] = address.to_be_bytes();
+                let [value_hi, value_lo] = value.to_be_bytes();
+                if response != [address_hi, address_lo, value_hi, value_lo] {
+                    return Err(Error::Readback(format!(
+                        "modbus write acknowledgement does not match register {address} value {value}"
+                    )));
+                }
                 Ok(())
             })
         }
@@ -257,6 +297,7 @@ mod serial {
                 stream: SerialStream(handle),
                 unit: unit_id,
                 proto: ModbusProto::Rtu,
+                transaction_id: 0,
             }))
         }
     }
@@ -313,10 +354,7 @@ mod tcp {
 
     /// Modbus TCP, for a serial bridge beside the inverter.
     ///
-    /// This is the route for an RS485-to-network adapter (Elfin EW11 and
-    /// similar), which lets the controller live somewhere other than next to
-    /// the inverter. It puts the home network in the control path: treat a
-    /// dropped connection as lost telemetry, not as a silent success.
+    /// The bridge must be configured for Modbus TCP, not raw RTU over TCP.
     pub struct TcpBus(StreamBus<TcpModbusStream>);
 
     impl TcpBus {
@@ -334,6 +372,7 @@ mod tcp {
                 stream: TcpModbusStream(stream),
                 unit: unit_id,
                 proto: ModbusProto::TcpUdp,
+                transaction_id: 0,
             }))
         }
     }
@@ -474,8 +513,12 @@ mod tests {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
                 match self.chunks.pop_front() {
                     Some(chunk) => {
-                        buf[..chunk.len()].copy_from_slice(&chunk);
-                        Ok(chunk.len())
+                        let n = buf.len().min(chunk.len());
+                        buf[..n].copy_from_slice(&chunk[..n]);
+                        if n < chunk.len() {
+                            self.chunks.push_front(chunk[n..].to_vec());
+                        }
+                        Ok(n)
                     }
                     None => Ok(0),
                 }
@@ -499,6 +542,7 @@ mod tests {
                 stream: ScriptedStream::replying(chunks),
                 unit: 1,
                 proto: ModbusProto::Rtu,
+                transaction_id: 0,
             }
         }
 
@@ -524,6 +568,99 @@ mod tests {
             let crc = crc16(&frame);
             frame.extend_from_slice(&crc);
             frame
+        }
+
+        fn frame(proto: ModbusProto, transaction: u16, pdu: &[u8]) -> Vec<u8> {
+            if proto == ModbusProto::TcpUdp {
+                let mut frame = transaction.to_be_bytes().to_vec();
+                frame.extend_from_slice(&[0, 0]);
+                frame.extend_from_slice(&((pdu.len() + 1) as u16).to_be_bytes());
+                frame.push(1);
+                frame.extend_from_slice(pdu);
+                frame
+            } else {
+                let mut frame = vec![1];
+                frame.extend_from_slice(pdu);
+                frame.extend_from_slice(&crc16(&frame));
+                frame
+            }
+        }
+
+        #[test]
+        fn write_acknowledgements_must_echo_the_register_and_value() {
+            for proto in [ModbusProto::Rtu, ModbusProto::TcpUdp] {
+                for (pdu, accepted) in [
+                    ([6, 0, 100, 0, 42], true),
+                    ([6, 0, 101, 0, 42], false),
+                    ([6, 0, 100, 0, 43], false),
+                ] {
+                    let response = frame(proto, 1, &pdu);
+                    let mut bus = rtu_bus(&[&response]);
+                    bus.proto = proto;
+                    assert_eq!(bus.write_holding(100, 42).is_ok(), accepted);
+                }
+            }
+        }
+
+        #[test]
+        fn reads_reject_empty_short_odd_and_extra_payloads() {
+            for proto in [ModbusProto::Rtu, ModbusProto::TcpUdp] {
+                for pdu in [
+                    vec![4, 0],
+                    vec![4, 1, 42],
+                    vec![4, 2, 0, 42],
+                    vec![4, 3, 0, 42, 0],
+                    vec![4, 6, 0, 42, 0, 43, 0, 44],
+                ] {
+                    let response = frame(proto, 1, &pdu);
+                    let mut bus = rtu_bus(&[&response]);
+                    bus.proto = proto;
+                    assert!(bus.read_input(100, 2).is_err(), "{pdu:?}");
+                }
+            }
+        }
+
+        #[test]
+        fn invalid_register_ranges_do_not_write_to_the_stream() {
+            for (address, words) in [(0, 0), (0, 126), (u16::MAX, 2)] {
+                let mut bus = rtu_bus(&[]);
+                assert!(matches!(
+                    bus.read_input(address, words),
+                    Err(crate::Error::Range(_))
+                ));
+                assert!(bus.stream.written.is_empty());
+            }
+        }
+
+        #[test]
+        fn tcp_requests_use_distinct_transaction_ids_and_reject_stale_replies() {
+            let response = frame(ModbusProto::TcpUdp, 1, &[4, 2, 0, 42]);
+            let mut bus = rtu_bus(&[&response, &response]);
+            bus.proto = ModbusProto::TcpUdp;
+            assert_eq!(bus.read_input(100, 1).unwrap(), vec![42]);
+            assert!(bus.read_input(101, 1).is_err());
+            assert_eq!(&bus.stream.written[..2], &[0, 1]);
+            assert_eq!(&bus.stream.written[12..14], &[0, 2]);
+        }
+
+        #[test]
+        fn coalesced_tcp_frames_are_read_separately() {
+            let mut responses = frame(ModbusProto::TcpUdp, 1, &[4, 2, 0, 42]);
+            responses.extend(frame(ModbusProto::TcpUdp, 2, &[4, 2, 0, 43]));
+            let mut bus = rtu_bus(&[&responses]);
+            bus.proto = ModbusProto::TcpUdp;
+            assert_eq!(bus.read_input(100, 1).unwrap(), vec![42]);
+            assert_eq!(bus.read_input(101, 1).unwrap(), vec![43]);
+        }
+
+        #[test]
+        fn malformed_tcp_lengths_return_errors_without_panicking() {
+            for length in [0u16, 2, 255, u16::MAX] {
+                let [hi, lo] = length.to_be_bytes();
+                let mut bus = rtu_bus(&[&[0, 1, 0, 0, hi, lo]]);
+                bus.proto = ModbusProto::TcpUdp;
+                assert!(bus.read_input(100, 1).is_err());
+            }
         }
 
         #[test]

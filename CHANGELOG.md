@@ -1,10 +1,18 @@
 # Changelog
 
-All notable changes to this crate are documented in this file.
+## Unreleased
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+### Fixed
+
+- Reject mock overrides without a timeout and clear overrides on passive.
+- Preserve surplus solar export during mock house-only discharge.
+- Include FoxESS read time in telemetry age.
+- Decode signed and unsigned 64-bit registers and reject invalid write scales.
+- Validate Modbus write acknowledgements and distinguish TCP transactions.
+
+### Changed
+
+- Shorten the README, API comments and commissioning instructions.
 
 ## [0.4.2] - 2026-09-06
 
@@ -88,8 +96,7 @@ and this project adheres to
 
 - The single-value `InverterExt` reads are now spelled `get_*`
   (`get_soc_pct`, `get_battery_kw`, `get_grid_kw`, `get_load_kw`,
-  `get_solar_kw`, `get_export_kw`), and `get_mode` joins them as the sugar
-  spelling of `Inverter::mode`. The prefix marks the cost: `get_*` performs
+  `get_solar_kw`, `get_export_kw`), and `get_mode` joins them as an alias of `Inverter::mode`. The prefix marks the cost: `get_*` performs
   a hardware read, while the same-named accessors on `Telemetry` are free
   field reads.
 
@@ -109,7 +116,7 @@ The initial release.
 - The `Inverter` trait — `capabilities`, `read_telemetry`, `apply`, `mode` —
   with `InverterExt` conveniences: `charge`/`discharge`/`export`/`passive`
   and single-field telemetry reads.
-- Honest command-expiry semantics: every accepted command reports how it
+- Command expiry: every accepted command reports how it
   will end (`Expiry`), and `Expiry::is_dead_controller_safe` separates a real
   one-shot inverter timeout from schedules and standing writes.
 - Capability discovery before commanding: `Capabilities` with
@@ -121,5 +128,5 @@ The initial release.
 - A read-only FoxESS H1 G1/G2 driver (`foxess` feature) built on community
   register maps, and the H1 remote-control watchdog block recorded as data
   for a future verified write path.
-- `MockInverter` (`mock` feature): a simulated battery with a genuine
+- `MockInverter` (`mock` feature): a simulated battery with a simulated
   one-shot command timeout, driveable in simulated time through `advance`.

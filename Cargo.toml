@@ -2,13 +2,9 @@
 name = "inverter"
 version = "0.4.2"
 edition = "2021"
-# MSRV is capped by serialport's dependency tree (edition 2024); the crate's
-# own code needs much less. Checked by the `msrv` CI job — bump consciously.
 rust-version = "1.85"
-# Resolve dependencies MSRV-aware, so the msrv job fails on our code, not on
-# a transitive dependency that raised its floor overnight.
 resolver = "3"
-description = "Hybrid solar/battery inverter control: telemetry, modes, and honest command-expiry semantics"
+description = "Hybrid solar/battery inverter control over Modbus"
 license = "MIT"
 repository = "https://github.com/kilowattclub/inverter"
 readme = "README.md"

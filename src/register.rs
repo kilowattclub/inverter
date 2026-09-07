@@ -1,7 +1,6 @@
 //! Modbus register definitions and value coding.
 //!
-//! Addresses are data, not logic. Each vendor module keeps its map in one
-//! place so a map can be checked against hardware without reading driver code.
+//! Vendor modules define addresses, widths, signs and scales as data.
 
 use crate::Error;
 
@@ -14,7 +13,7 @@ pub enum RegKind {
     Holding,
 }
 
-/// One register, described well enough to read, decode and write it.
+/// Register address, width and value encoding.
 #[derive(Debug, Clone, Copy)]
 pub struct RegisterDef {
     /// Name used in logs and error messages.
@@ -76,30 +75,40 @@ impl RegisterDef {
 }
 
 /// Decode raw words into engineering units, most significant word first.
+///
+/// # Panics
+///
+/// Panics unless the definition spans 1–4 words and `words` has that length.
 pub fn decode(reg: &RegisterDef, words: &[u16]) -> f64 {
-    let mut raw: i64 = 0;
+    assert!((1..=4).contains(&reg.words), "register must span 1–4 words");
+    assert_eq!(words.len(), usize::from(reg.words), "register width mismatch");
+    let mut raw: u64 = 0;
     for &w in words {
-        raw = (raw << 16) | w as i64;
+        raw = (raw << 16) | u64::from(w);
     }
-    if reg.signed {
-        let bits = 16 * reg.words as u32;
-        if raw >= 1i64 << (bits - 1) {
-            raw -= 1i64 << bits;
-        }
-    }
-    raw as f64 * reg.scale
+    let value = if reg.signed {
+        let shift = 64 - 16 * u32::from(reg.words);
+        ((raw << shift) as i64 >> shift) as f64
+    } else {
+        raw as f64
+    };
+    value * reg.scale
 }
 
 /// Encode an engineering value into a single raw word.
 ///
-/// Rejects anything that would silently wrap: NaN, infinities, and values
-/// outside the register's representable range. Writing a wrapped power
-/// setpoint to an inverter is exactly the class of bug this prevents.
+/// Rejects non-finite values and values outside the register range.
 pub fn encode(reg: &RegisterDef, value: f64) -> Result<u16, Error> {
     if reg.words != 1 {
         return Err(Error::Range(format!(
             "{} spans {} words; multi-word writes are not supported",
             reg.name, reg.words
+        )));
+    }
+    if !reg.scale.is_finite() || reg.scale == 0.0 {
+        return Err(Error::Range(format!(
+            "{} requires a finite, non-zero scale",
+            reg.name
         )));
     }
     let raw = (value / reg.scale).round();
@@ -134,6 +143,28 @@ pub fn encode(reg: &RegisterDef, value: f64) -> Result<u16, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_signed_and_unsigned_four_word_values() {
+        let reg = RegisterDef::input("wide", 1).words(4);
+        assert_eq!(decode(&reg, &[u16::MAX; 4]), u64::MAX as f64);
+        assert_eq!(decode(&reg.signed(), &[u16::MAX; 4]), -1.0);
+        assert_eq!(decode(&reg.signed(), &[0x8000, 0, 0, 0]), i64::MIN as f64);
+    }
+
+    #[test]
+    fn encode_rejects_invalid_scales() {
+        for scale in [0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let reg = RegisterDef::holding("power", 1).scale(scale);
+            assert!(encode(&reg, 1.0).is_err());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "register width mismatch")]
+    fn decode_rejects_missing_words() {
+        decode(&RegisterDef::input("wide", 1).words(2), &[1]);
+    }
 
     #[test]
     fn decodes_a_scaled_unsigned_word() {

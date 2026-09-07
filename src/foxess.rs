@@ -1,28 +1,11 @@
 //! FoxESS H1-series driver.
 //!
-//! The register maps here are compiled from community documentation — principally the
-//! [`nathanmarlor/foxess_modbus`](https://github.com/nathanmarlor/foxess_modbus)
-//! Home Assistant integration (MIT). Telemetry and the H1 remote-control block
-//! have been exercised by that project across H1-family hardware, but remain
-//! model- and firmware-sensitive; see the crate README before enabling a real
-//! installation.
+//! Maps are based on the [foxess_modbus](https://github.com/nathanmarlor/foxess_modbus)
+//! integration. Select [`registers::H1_G1`] for input registers or
+//! [`registers::H1_G2`] for holding registers. The built-in LAN map is unsupported.
 //!
-//! # Which map?
-//!
-//! The H1 generations differ over the same RS485 wire: a G1 serves telemetry
-//! as *input* registers in the 11000 range, while a G2 (H1-\*-G2, AC1-G2, P1)
-//! serves *holding* registers in the 31000 range. Pick [`registers::H1_G1`]
-//! or [`registers::H1_G2`] to match the unit. An H1 connected through its own
-//! LAN module speaks a third, reduced map that this driver does not cover.
-//!
-//! # Native command timeout
-//!
-//! The H1's remote-control block (see [`registers::remote_control`]) carries
-//! a genuine watchdog: a timeout register the inverter counts down on its own
-//! and, on expiry, reverts to its programmed work mode. This driver programs
-//! self-use as that fallback, replaces the timeout before every command, and
-//! disables remote control for passive. The countdown lives in the inverter,
-//! so a dead controller still leaves the command expiring by itself.
+//! Overrides use the inverter watchdog and return to self-use on expiry.
+//! Check register and timeout behaviour on the installed model and firmware.
 
 use crate::modbus::{read_words, with_retries, ModbusBus};
 use crate::register::{decode, encode, RegisterDef};
@@ -65,11 +48,9 @@ pub struct RegisterMap {
     pub pv_powers: &'static [RegisterDef],
 }
 
-/// FoxESS H1-shaped Modbus maps. Every address is unverified.
+/// FoxESS H1 RS485 maps from `foxess_modbus` (MIT).
 ///
-/// Addresses live here and nowhere else, so a map can be checked against
-/// hardware without reading driver code. Sources: `foxess_modbus`
-/// `entity_descriptions.py` and `remote_control_description.py` (MIT).
+/// Sources: `entity_descriptions.py` and `remote_control_description.py`.
 pub mod registers {
     use super::RegisterMap;
     use crate::register::RegisterDef as R;
@@ -304,6 +285,8 @@ impl<B: ModbusBus> Inverter for FoxEss<B> {
     }
 
     fn read_telemetry(&mut self) -> Result<Telemetry, Error> {
+        let at = SystemTime::now();
+        let read_at = Instant::now();
         let map = self.map;
         let soc_pct = self.read(&map.battery_soc)?;
         let battery_kw = self.read(&map.battery_power)?;
@@ -321,8 +304,8 @@ impl<B: ModbusBus> Inverter for FoxEss<B> {
             grid_kw,
             load_kw,
             solar_kw,
-            at: SystemTime::now(),
-            read_at: Instant::now(),
+            at,
+            read_at,
         })
     }
 
@@ -473,6 +456,35 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_age_includes_time_spent_reading_registers() {
+        struct TimedBus {
+            inner: FakeBus,
+            first_read: Option<Instant>,
+        }
+        impl ModbusBus for TimedBus {
+            fn read_input(&mut self, address: u16, words: u8) -> Result<Vec<u16>, Error> {
+                self.inner.read_input(address, words)
+            }
+            fn read_holding(&mut self, address: u16, words: u8) -> Result<Vec<u16>, Error> {
+                self.first_read.get_or_insert_with(Instant::now);
+                self.inner.read_holding(address, words)
+            }
+            fn write_holding(&mut self, address: u16, value: u16) -> Result<(), Error> {
+                self.inner.write_holding(address, value)
+            }
+        }
+        let mut inv = FoxEss::new(
+            TimedBus {
+                inner: g2_fixture(),
+                first_read: None,
+            },
+            &registers::H1_G2,
+        );
+        let telemetry = inv.read_telemetry().unwrap();
+        assert!(telemetry.read_at <= inv.bus.first_read.unwrap());
+    }
+
+    #[test]
     fn reports_native_timeout_write_capability() {
         for map in [&registers::H1_G1, &registers::H1_G2] {
             let inv = FoxEss::new(FakeBus::with_input(&[]), map);
@@ -490,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_read_back_is_honestly_unsupported() {
+    fn mode_read_back_is_unsupported() {
         let mut inv = FoxEss::new(g2_fixture(), &registers::H1_G2);
         assert!(matches!(inv.mode(), Err(Error::Unsupported(_))));
     }
@@ -630,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn a_g2_wired_up_with_the_g1_map_fails_rather_than_lying() {
+    fn a_g2_with_the_g1_map_returns_an_error() {
         // The maps live in different register tables, so the mismatch is an
         // error instead of plausible zeroes.
         let mut inv = FoxEss::new(g2_fixture(), &registers::H1_G1);

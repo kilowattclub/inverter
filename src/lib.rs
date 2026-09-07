@@ -1,25 +1,19 @@
 //! Control hybrid solar/battery inverters over Modbus.
 //!
-//! The crate exists to make one distinction impossible to ignore: **how a
-//! command ends**. Telling an inverter to charge for twenty minutes and
-//! programming a daily window that starts at the same moment look identical
-//! at most APIs, and they are not the same thing. The first stops on its own
-//! if the controller dies; the second repeats tomorrow, and every day after,
-//! with nobody left to cancel it. See [`Expiry`].
+//! Read telemetry, check driver capabilities and apply commands with explicit
+//! timeouts. [`Applied`] reports the accepted power and [`Expiry`].
 //!
 //! # Sign conventions
 //!
-//! Every driver reports telemetry with these signs, whatever the inverter's
-//! own convention is:
+//! All drivers use these signs:
 //!
 //! * `battery_kw > 0` — charging (power into the cells)
 //! * `grid_kw > 0` — importing; `< 0` — exporting
 //! * `load_kw >= 0` — household consumption
 //! * `solar_kw >= 0` — PV generation, `0.0` when the model cannot report it
 //!
-//! All powers are kilowatts and energies kilowatt-hours. Anywhere a power is
-//! taken, any numeric type convertible to `f64` is accepted: `charge(2)` and
-//! `charge(2.5)` both work.
+//! Powers are kilowatts and energies are kilowatt-hours. Power arguments accept
+//! numeric types convertible to `f64`.
 //!
 //! # Example
 //!
@@ -36,14 +30,12 @@
 //! let telemetry = inv.read_telemetry()?;
 //! println!("battery at {}%", telemetry.soc_pct);
 //!
-//! // Or single values, and the mode currently in force:
+//! // Single-value reads:
 //! let soc = inv.get_soc_pct()?;
 //! assert_eq!(inv.get_mode()?, Mode::Passive);
 //!
 //! if caps.supports(Mode::ForceCharge) {
-//!     // Every override has an explicit TTL. Powers are kilowatts.
 //!     let applied = inv.charge(2, Duration::from_secs(60))?;
-//!     // How this command ends is data, not an assumption.
 //!     println!("expires: {:?}", applied.expiry);
 //! }
 //! # Ok(())
@@ -54,8 +46,7 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
-// `doc_auto_cfg` was merged into `doc_cfg` in Rust 1.92; the automatic
-// feature-requirement banners on docs.rs come from this single gate now.
+// Feature banners on docs.rs.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::time::{Duration, Instant, SystemTime};
@@ -74,10 +65,7 @@ pub mod foxess;
 #[cfg(feature = "mock")]
 pub mod mock;
 
-/// Everything that can go wrong talking to an inverter.
-///
-/// Drivers report failures rather than returning plausible-looking data: a
-/// zero that came from a dropped frame is far more dangerous than an error.
+/// Inverter communication, validation and capability errors.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -94,51 +82,21 @@ pub enum Error {
     Range(String),
 
     /// The driver does not implement this operation for this model.
-    ///
-    /// Prefer checking [`Capabilities`] first — this exists for the case where
-    /// a caller commands something the inverter turned out not to accept.
     #[error("unsupported: {0}")]
     Unsupported(String),
 }
 
-/// What the inverter should be doing.
-///
-/// [`Passive`](Mode::Passive) is the inverter's own behaviour; the other three
-/// override it. The overrides are what need [`Expiry`] semantics — passive
-/// has no power level and nothing to expire, which is what makes it the safe
-/// fallback.
+/// Inverter operating mode. Overrides require a timeout and return to passive.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Mode {
-    /// The controller steps out of the way: the inverter runs its own
-    /// self-use logic, exactly as it would with no controller attached.
-    ///
-    /// Concretely: solar powers the house; surplus charges the battery, then
-    /// exports once the battery is full; after dark the battery covers the
-    /// house down to the inverter's configured minimum state of charge, then
-    /// the grid takes over. "Passive" describes the *controller's* stance —
-    /// the hardware is busy. Vendors call this "self-use",
-    /// "self-consumption" or "general" mode.
-    ///
-    /// This is the state every writable driver must be able to return to,
-    /// the state a caller should fall back to when unsure, and the state a
-    /// dead controller's hardware should decay to.
+    /// Self-use: solar supplies the house, surplus charges the battery, and
+    /// the battery covers demand down to its configured minimum SoC.
     Passive,
-    /// Keep battery power at zero: the house and battery neither charge nor
-    /// discharge one another until the command expires.
-    ///
-    /// Unlike [`Passive`](Mode::Passive), this reserves stored energy instead
-    /// of letting the inverter's self-use logic spend it on the house.
+    /// Keep battery power at zero until the command expires.
     Hold,
-    /// Force energy into the battery now, importing from the grid when solar
-    /// cannot cover the requested power.
-    ///
-    /// Overrides the self-use economics — this is how a controller buys a
-    /// cheap tariff window.
+    /// Charge the battery, importing from the grid as needed.
     ForceCharge,
-    /// Force energy out of the battery now.
-    ///
-    /// Where the energy goes — household load only, or deliberately out past
-    /// the meter — is the command's [`DischargeTarget`].
+    /// Discharge towards the command's [`DischargeTarget`].
     ForceDischarge,
 }
 
@@ -186,16 +144,12 @@ impl std::str::FromStr for Mode {
     }
 }
 
-/// Where discharged energy is meant to go.
-///
-/// This is a target, not a permission: the caller decides policy. It is part
-/// of the command because some inverters reach the two behaviours through
-/// different work modes rather than through a power limit.
+/// Discharge target. Support depends on the driver.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum DischargeTarget {
     /// Cover household load only; do not push power out to the grid.
     HouseOnly,
-    /// Deliberately export to the grid, for a grid-services event.
+    /// Allow discharge to export to the grid.
     GridExport,
 }
 
@@ -293,68 +247,40 @@ impl std::fmt::Display for Command {
     }
 }
 
-/// How a non-passive command stops.
-///
-/// The reason this crate exists. A caller that treats
-/// [`Expiry::RecurringWindow`] as though it were
-/// [`Expiry::InverterTimeout`] has built a system that keeps forcing a
-/// battery after the controller is gone — every day, at the same time, until
-/// someone notices.
+/// How a command ends.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Expiry {
-    /// The inverter reverts by itself after this long, once, without repeating.
-    ///
-    /// The only variant that is a true fail-safe against a dead controller.
+    /// One-shot inverter timeout. Returns to passive without controller action.
     InverterTimeout(Duration),
 
-    /// The inverter reverts when a condition it evaluates is met — a target
-    /// state of charge, for instance.
-    ///
-    /// Bounded, but not bounded in *time*: a battery that never reaches the
-    /// threshold never reverts.
+    /// Reverts on an inverter condition, such as target SoC; not time-bounded.
     InverterCondition(&'static str),
 
-    /// A schedule that repeats on the inverter's own clock.
-    ///
-    /// **Not a fail-safe.** It outlives the controller and fires again
-    /// tomorrow. Anything relying on it must have another way to revert.
+    /// Repeating schedule that remains active without a controller.
     RecurringWindow,
 
-    /// Applies until something changes it.
-    ///
-    /// **Not a fail-safe.** If the controller stops, the command stands.
+    /// Remains active until overwritten.
     UntilChanged,
 }
 
 impl Expiry {
-    /// Whether a dead controller leaves the inverter safely reverting on its own.
-    ///
-    /// Callers that can only tolerate a genuine dead-man's handle should refuse
-    /// to issue non-passive commands when this is `false`.
+    /// Whether this is a non-zero, one-shot inverter timeout.
     #[must_use]
     pub fn is_dead_controller_safe(&self) -> bool {
         matches!(self, Expiry::InverterTimeout(timeout) if !timeout.is_zero())
     }
 }
 
-/// What a driver can actually do with the connected hardware.
+/// Driver support for the connected model and transport.
 ///
-/// Ask before you command. Feature support varies by model *and* by how the
-/// inverter is connected — the same unit over RS485 and over its own network
-/// module does not expose the same registers.
-///
-/// The struct is `#[non_exhaustive]` so capabilities can grow without
-/// breaking callers. Drivers outside this crate therefore build it through
-/// [`Capabilities::read_only`] or [`Capabilities::writable`] and then set the
-/// public reporting fields directly.
+/// Construct with [`Capabilities::read_only`] or [`Capabilities::writable`],
+/// then set the public reporting fields.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]
 pub struct Capabilities {
     /// Human-readable model or map identifier, for logs and diagnostics.
     pub model: &'static str,
     /// Whether this driver writes to the inverter at all.
-    ///
-    /// A read-only driver still reports telemetry; it just refuses commands.
     pub can_write: bool,
     /// Modes this driver can command. Always contains [`Mode::Passive`] when
     /// `can_write` is true.
@@ -377,10 +303,7 @@ pub struct Capabilities {
 impl Capabilities {
     /// A driver that reports telemetry but refuses every command.
     ///
-    /// `reason` is surfaced through [`Capabilities::write_blocked_reason`] so
-    /// a caller can log *why* writes are unavailable instead of a bare
-    /// "unsupported". The reporting flags start `false`; set the public
-    /// fields for whatever the driver can do:
+    /// Reporting flags default to `false`. Set them to match the driver:
     ///
     /// ```
     /// use inverter::Capabilities;
@@ -410,8 +333,7 @@ impl Capabilities {
     ///
     /// # Panics
     ///
-    /// Panics unless `modes` contains [`Mode::Passive`]: a writable driver
-    /// that cannot step out of the way leaves callers with no safe fallback.
+    /// Panics unless `modes` contains [`Mode::Passive`].
     #[must_use]
     pub fn writable(model: &'static str, modes: &'static [Mode], expiry: Expiry) -> Self {
         assert!(
@@ -453,10 +375,7 @@ pub struct Telemetry {
     pub solar_kw: f64,
     /// Wall-clock time of the reading, for display and storage.
     pub at: SystemTime,
-    /// Monotonic time of the reading.
-    ///
-    /// Use this for staleness checks: unlike [`Telemetry::at`] it cannot be
-    /// dragged backwards by an NTP step or a daylight-saving change.
+    /// Monotonic start time of the reading, used for staleness checks.
     pub read_at: Instant,
 }
 
@@ -474,7 +393,7 @@ impl Telemetry {
     }
 }
 
-/// What the inverter accepted, which may be less than what was asked for.
+/// Accepted power setpoint and expiry.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Applied {
     /// How this command will actually end.
@@ -488,10 +407,8 @@ pub struct Applied {
     pub power_kw: f64,
 }
 
-/// An inverter this crate can talk to.
-///
-/// Implementors must report failures rather than returning plausible data,
-/// and must honour the crate's sign conventions.
+/// Inverter driver. Implementations must use the crate's sign conventions
+/// and return errors for failed reads and writes.
 pub trait Inverter: Send {
     /// What this driver can do with the connected hardware.
     ///
@@ -511,33 +428,19 @@ pub trait Inverter: Send {
     /// non-passive command without changing inverter state.
     fn apply(&mut self, command: Command) -> Result<Applied, Error>;
 
-    /// The [`Mode`] currently in force, as far as this driver can know it.
-    ///
-    /// Drivers must not guess. A driver that cannot read the imposed state
-    /// back from the hardware returns [`Error::Unsupported`] rather than
-    /// repeating what it last commanded — a stale belief is exactly the
-    /// mistake that hides an expired or externally-changed command.
-    /// [`Capabilities::reports_mode`] says up front whether this can answer.
+    /// Read the current mode. Returns [`Error::Unsupported`] when the driver
+    /// cannot read it back; see [`Capabilities::reports_mode`].
     fn mode(&mut self) -> Result<Mode, Error>;
 
     /// Release the transport. Called once, on shutdown.
     fn close(&mut self) {}
 }
 
-/// Partial applications of the [`Inverter`] operations.
+/// Command and single-value read methods for every [`Inverter`].
 ///
-/// Sugar only, in two groups. Every non-passive command method requires its
-/// TTL at the call site, builds the matching [`Command`], and calls
-/// [`Inverter::apply`]. The `get_*` methods each perform a **full**
-/// [`Inverter::read_telemetry`] (or [`Inverter::mode`]) and return one value —
-/// convenient for a one-off check, wasteful in a loop; when you need several
-/// values, read once and use the fields. The prefix marks the cost: `get_*`
-/// talks to hardware, while same-named accessors on [`Telemetry`] are free
-/// field reads.
-///
-/// The blanket implementation is the only one the coherence rules allow, so
-/// no driver can override these — every spelling reaches hardware through
-/// `apply` and `read_telemetry`.
+/// Command methods call [`Inverter::apply`]. Each telemetry getter performs
+/// a full [`Inverter::read_telemetry`]; read once when several values are needed.
+/// [`InverterExt::get_mode`] calls [`Inverter::mode`].
 pub trait InverterExt: Inverter {
     /// Return to the inverter's own self-use behaviour ([`Mode::Passive`]).
     fn passive(&mut self) -> Result<Applied, Error> {
@@ -599,9 +502,7 @@ pub trait InverterExt: Inverter {
         Ok(self.read_telemetry()?.export_kw())
     }
 
-    /// The [`Mode`] currently in force — the `get_*` spelling of
-    /// [`Inverter::mode`], with the same contract: drivers that cannot read
-    /// it back honestly error rather than guessing.
+    /// Read the current mode; see [`Inverter::mode`].
     fn get_mode(&mut self) -> Result<Mode, Error> {
         self.mode()
     }
