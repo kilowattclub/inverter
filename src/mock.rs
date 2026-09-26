@@ -211,7 +211,7 @@ impl Inverter for MockInverter {
         // discard fields that do not apply to the selected mode.
         if command.mode == Mode::Passive {
             command = Command::passive();
-        } else if !command.ttl().is_some_and(|ttl| !ttl.is_zero()) {
+        } else if command.ttl().is_none_or(|ttl| ttl.is_zero()) {
             return Err(Error::Range(
                 "non-passive command requires a non-zero TTL".into(),
             ));
