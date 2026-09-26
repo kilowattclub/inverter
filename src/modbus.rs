@@ -471,6 +471,11 @@ mod serial {
             let old = adapter.attach();
             let original_path = std::fs::read_link(&adapter.path).unwrap();
             let mut bus = adapter.open();
+            // Allocate the replacement while the old PTY still exists, so its
+            // number cannot be reused when other tests release their PTYs.
+            let (mut new, mut new_slave) = serialport::TTYPort::pair().unwrap();
+            new.set_timeout(Duration::from_secs(3)).unwrap();
+            new_slave.set_exclusive(false).unwrap();
             drop(old); // USB removed, leaving the existing handle unusable.
             assert!(matches!(
                 super::super::with_retries(&mut bus, "test", "write", |bus| bus
@@ -495,8 +500,9 @@ mod serial {
                 "backoff must prevent an immediate reopen"
             );
 
-            let _reserve_old_tty = serialport::TTYPort::pair().unwrap();
-            let mut new = adapter.attach();
+            std::fs::remove_file(&adapter.path).unwrap();
+            std::os::unix::fs::symlink(new_slave.name().unwrap(), &adapter.path).unwrap();
+            drop(new_slave);
             assert_ne!(std::fs::read_link(&adapter.path).unwrap(), original_path);
             bus.next_open = Instant::now();
             assert!(matches!(
