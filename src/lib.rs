@@ -73,6 +73,11 @@ pub enum Error {
     #[error("communication error: {0}")]
     Comm(String),
 
+    /// The connection was lost or is waiting to reopen. Discard the current
+    /// operation; obtain fresh telemetry before deciding on another command.
+    #[error("inverter disconnected: {0}")]
+    Disconnected(String),
+
     /// A write acknowledgement or register read-back did not match the request.
     #[error("read-back mismatch: {0}")]
     Readback(String),

@@ -41,6 +41,14 @@ Use `open(OpenOptions { ... })` to select `mock`, `mock-relay` or `foxess`
 from configuration. The factory uses H1 G2 for FoxESS; `unit_id: 0` selects
 247. Unknown drivers, missing features and connection failures return errors.
 
+If an open serial connection fails, the driver drops it and returns
+`Error::Disconnected`. Later reads reopen the configured path with a delay
+that grows from 0.5 to 30 seconds. Use `/dev/serial/by-id/...` so a USB adapter
+can return under a different tty number. Writes never reopen the port or
+replay an interrupted command. After a disconnect, read fresh telemetry and
+decide what to apply again. The inverter's hardware timeout remains the
+fallback while communication is unavailable.
+
 [API reference](https://docs.rs/inverter) · `cargo run --example tour`
 
 ## Commands

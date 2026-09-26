@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Reopen disconnected serial adapters by their configured path with bounded
+  backoff. Return `Error::Disconnected` immediately so samples and commands
+  cannot cross a reconnection; only subsequent reads reopen the port.
 - Reject mock overrides without a timeout and clear overrides on passive.
 - Preserve surplus solar export during mock house-only discharge.
 - Include FoxESS read time in telemetry age.

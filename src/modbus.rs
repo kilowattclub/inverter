@@ -39,6 +39,7 @@ pub fn read_words(bus: &mut dyn ModbusBus, reg: &RegisterDef) -> Result<Vec<u16>
 }
 
 /// Run up to three attempts, with 500 ms and 1 s delays between failures.
+/// A lost connection returns immediately; callers must start a fresh operation.
 pub fn with_retries<B: ModbusBus + ?Sized, R>(
     bus: &mut B,
     log_target: &str,
@@ -55,6 +56,11 @@ pub fn with_retries<B: ModbusBus + ?Sized, R>(
                     target: log_target,
                     "modbus operation failed: operation={operation} attempt={attempt} error={error}"
                 );
+                // A retry must not reopen a connection in the middle of a
+                // telemetry sample or replay part of an old control command.
+                if matches!(error, Error::Disconnected(_)) {
+                    return Err(error);
+                }
                 last_error = Some(error);
                 if attempt < RETRIES {
                     std::thread::sleep(delay);
@@ -244,7 +250,7 @@ mod stream {
 #[cfg(feature = "serial")]
 mod serial {
     use std::io::{Read, Write};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use rmodbus::ModbusProto;
 
@@ -279,11 +285,39 @@ mod serial {
     ///
     /// Use a stable `/dev/serial/by-id/...` path rather than `/dev/ttyUSB0`,
     /// whose number changes across boots and when another adapter is present.
-    pub struct SerialBus(StreamBus<SerialStream>);
+    /// A failed transaction closes the handle and returns `Error::Disconnected`.
+    /// Subsequent reads reopen the configured path with 0.5–30 second backoff.
+    /// Writes never reopen or replay an interrupted operation.
+    pub struct SerialBus {
+        port: String,
+        baud_rate: u32,
+        unit_id: u8,
+        bus: Option<StreamBus<SerialStream>>,
+        next_open: Instant,
+        backoff: Duration,
+    }
+
+    const MIN_BACKOFF: Duration = Duration::from_millis(500);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
     impl SerialBus {
         /// Open `port` at `baud_rate`, addressing unit `unit_id`.
         pub fn open(port: &str, baud_rate: u32, unit_id: u8) -> Result<Self, Error> {
+            Ok(Self {
+                port: port.into(),
+                baud_rate,
+                unit_id,
+                bus: Some(Self::connect(port, baud_rate, unit_id)?),
+                next_open: Instant::now(),
+                backoff: MIN_BACKOFF,
+            })
+        }
+
+        fn connect(
+            port: &str,
+            baud_rate: u32,
+            unit_id: u8,
+        ) -> Result<StreamBus<SerialStream>, Error> {
             let handle = serialport::new(port, baud_rate)
                 .data_bits(serialport::DataBits::Eight)
                 .parity(serialport::Parity::None)
@@ -291,24 +325,211 @@ mod serial {
                 .timeout(Duration::from_secs(2))
                 .open()
                 .map_err(|e| Error::Comm(format!("could not open serial port {port}: {e}")))?;
-            Ok(Self(StreamBus {
+            Ok(StreamBus {
                 stream: SerialStream(handle),
                 unit: unit_id,
                 proto: ModbusProto::Rtu,
                 transaction_id: 0,
-            }))
+            })
+        }
+
+        fn reopen_for_read(&mut self) -> Result<(), Error> {
+            if self.bus.is_some() {
+                return Ok(());
+            }
+            if Instant::now() < self.next_open {
+                return Err(Error::Disconnected("waiting to reopen serial port".into()));
+            }
+            match Self::connect(&self.port, self.baud_rate, self.unit_id) {
+                Ok(bus) => {
+                    self.bus = Some(bus);
+                    log::info!(target: "inverter.serial", "reopened {}; reading fresh telemetry", self.port);
+                    Ok(())
+                }
+                Err(error) => {
+                    self.defer_open();
+                    Err(Error::Disconnected(error.to_string()))
+                }
+            }
+        }
+
+        fn defer_open(&mut self) {
+            self.next_open = Instant::now() + self.backoff;
+            self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+        }
+
+        fn finish<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
+            match result {
+                Err(error @ Error::Comm(_)) => {
+                    // Dropping the handle matters: the same by-id symlink can
+                    // now point at a new tty after a USB disconnect/reconnect.
+                    self.bus = None;
+                    self.defer_open();
+                    Err(Error::Disconnected(error.to_string()))
+                }
+                Ok(value) => {
+                    self.backoff = MIN_BACKOFF;
+                    Ok(value)
+                }
+                Err(error) => Err(error),
+            }
         }
     }
 
     impl ModbusBus for SerialBus {
         fn read_input(&mut self, address: u16, words: u8) -> Result<Vec<u16>, Error> {
-            self.0.read_input(address, words)
+            self.reopen_for_read()?;
+            let result = self
+                .bus
+                .as_mut()
+                .expect("open serial bus")
+                .read_input(address, words);
+            self.finish(result)
         }
         fn read_holding(&mut self, address: u16, words: u8) -> Result<Vec<u16>, Error> {
-            self.0.read_holding(address, words)
+            self.reopen_for_read()?;
+            let result = self
+                .bus
+                .as_mut()
+                .expect("open serial bus")
+                .read_holding(address, words);
+            self.finish(result)
         }
         fn write_holding(&mut self, address: u16, value: u16) -> Result<(), Error> {
-            self.0.write_holding(address, value)
+            let bus = self.bus.as_mut().ok_or_else(|| {
+                Error::Disconnected("read fresh telemetry before writing after a disconnect".into())
+            })?;
+            let result = bus.write_holding(address, value);
+            self.finish(result)
+        }
+    }
+
+    // macOS's serial driver requires modem ioctls that pseudo-terminals do
+    // not support. Exercise USB replacement with Linux PTYs (the Pi's OS).
+    #[cfg(all(test, target_os = "linux"))]
+    mod tests {
+        use super::*;
+        use serialport::SerialPort;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Adapter {
+            path: std::path::PathBuf,
+        }
+
+        impl Adapter {
+            fn new() -> Self {
+                static ID: AtomicUsize = AtomicUsize::new(0);
+                let path = std::env::temp_dir().join(format!(
+                    "inverter-serial-{}-{}",
+                    std::process::id(),
+                    ID.fetch_add(1, Ordering::Relaxed)
+                ));
+                Self { path }
+            }
+
+            fn attach(&self) -> serialport::TTYPort {
+                let (mut master, mut slave) = serialport::TTYPort::pair().unwrap();
+                master.set_timeout(Duration::from_secs(3)).unwrap();
+                slave.set_exclusive(false).unwrap();
+                let _ = std::fs::remove_file(&self.path);
+                std::os::unix::fs::symlink(slave.name().unwrap(), &self.path).unwrap();
+                master
+            }
+
+            fn open(&self) -> SerialBus {
+                SerialBus::open(self.path.to_str().unwrap(), 9600, 1).unwrap()
+            }
+        }
+
+        impl Drop for Adapter {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+
+        fn reply(master: &mut serialport::TTYPort) {
+            let mut request = [0u8; 8];
+            master.read_exact(&mut request).unwrap();
+            // The first operation on a reopened connection must be a read,
+            // never the interrupted write to register 44002.
+            assert_eq!(request[1], 3);
+            let mut response = vec![request[0], 3, 2, 0, 42];
+            let mut crc = 0xffff_u16;
+            for byte in &response {
+                crc ^= u16::from(*byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ if crc & 1 != 0 { 0xa001 } else { 0 };
+                }
+            }
+            response.extend_from_slice(&crc.to_le_bytes());
+            master.write_all(&response).unwrap();
+        }
+
+        #[test]
+        fn usb_replacement_reopens_stable_path_without_replaying_a_failed_write() {
+            let adapter = Adapter::new();
+            let old = adapter.attach();
+            let original_path = std::fs::read_link(&adapter.path).unwrap();
+            let mut bus = adapter.open();
+            drop(old); // USB removed, leaving the existing handle unusable.
+            assert!(matches!(
+                super::super::with_retries(&mut bus, "test", "write", |bus| bus
+                    .write_holding(44002, 2000)),
+                Err(Error::Disconnected(_))
+            ));
+            assert!(bus.bus.is_none());
+
+            // Device remains absent: reads fail, with bounded reopen attempts.
+            bus.next_open = Instant::now();
+            assert!(matches!(
+                bus.read_holding(31000, 1),
+                Err(Error::Disconnected(_))
+            ));
+            let scheduled = bus.next_open;
+            assert!(matches!(
+                bus.read_holding(31000, 1),
+                Err(Error::Disconnected(_))
+            ));
+            assert_eq!(
+                bus.next_open, scheduled,
+                "backoff must prevent an immediate reopen"
+            );
+
+            let _reserve_old_tty = serialport::TTYPort::pair().unwrap();
+            let mut new = adapter.attach();
+            assert_ne!(std::fs::read_link(&adapter.path).unwrap(), original_path);
+            bus.next_open = Instant::now();
+            assert!(matches!(
+                bus.write_holding(44002, 2000),
+                Err(Error::Disconnected(_))
+            ));
+            assert!(bus.bus.is_none(), "writes must never reopen the adapter");
+            let (done, wait) = std::sync::mpsc::channel();
+            let device = std::thread::spawn(move || {
+                reply(&mut new);
+                wait.recv_timeout(Duration::from_secs(3)).unwrap();
+            });
+            assert_eq!(bus.read_holding(31000, 1).unwrap(), vec![42]);
+            done.send(()).unwrap();
+            device.join().unwrap();
+        }
+
+        #[test]
+        fn disconnected_read_is_returned_to_the_caller_without_hidden_reconnection() {
+            let adapter = Adapter::new();
+            let master = adapter.attach();
+            let mut bus = adapter.open();
+            drop(master);
+            let mut calls = 0;
+            let result = super::super::with_retries(&mut bus, "test", "read", |bus| {
+                calls += 1;
+                bus.read_input(100, 1)
+            });
+            assert!(matches!(result, Err(Error::Disconnected(_))));
+            assert_eq!(
+                calls, 1,
+                "a partial sample must not continue on a new connection"
+            );
         }
     }
 }

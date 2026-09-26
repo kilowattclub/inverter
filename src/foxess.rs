@@ -242,6 +242,9 @@ impl<B: ModbusBus> FoxEss<B> {
     fn disable_after_error(&mut self, error: Error) -> Error {
         match self.return_to_passive() {
             Ok(()) => error,
+            Err(disable_error @ Error::Disconnected(_)) => Error::Disconnected(format!(
+                "{error}; could not return to passive: {disable_error}"
+            )),
             Err(disable_error) => Error::Comm(format!(
                 "command failed ({error}); also failed to return FoxESS to passive ({disable_error})"
             )),
